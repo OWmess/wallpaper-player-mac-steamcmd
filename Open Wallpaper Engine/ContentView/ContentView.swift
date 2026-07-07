@@ -60,8 +60,7 @@ struct ContentView: View {
                         case 1:
                             WallpaperDiscover()
                         case 2:
-                            ExplorerTopBar(contentViewModel: viewModel)
-                            WorkingInProgress()
+                            SteamWorkshopBrowser(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                         default:
                             fatalError()

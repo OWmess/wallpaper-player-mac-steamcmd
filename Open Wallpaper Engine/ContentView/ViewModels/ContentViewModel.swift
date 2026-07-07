@@ -70,26 +70,17 @@ class ContentViewModel: ObservableObject, DropDelegate {
 //        }
 //    }
     
-    private var urls: [URL] {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0],
-            includingPropertiesForKeys: nil,
-            options: .skipsHiddenFiles
-        ) else {
-            return []
-        }
-        return contents
+    private var documentDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
     
     /// Show all the wallpaper inside application wallpaper directory, without being filtered
     private var allWallpapers: [WEWallpaper] {
-        self.urls.map({ url in
-            if let data = try? Data(contentsOf: url.appending(path: "project.json")), let project = try? JSONDecoder().decode(WEProject.self, from: data) {
-                return WEWallpaper(using: project, where: url)
-            } else {
-                return WEWallpaper(using: .invalid, where: url)
-            }
-        })
+        let steamCMDResolution = SteamCMDPathResolver.resolve()
+        return WallpaperLibraryService.scanInstalledWallpapers(
+            documentDirectory: documentDirectory,
+            workshopContentDirectories: steamCMDResolution.workshopContentDirectories
+        )
     }
     
     private var filteredWallpapers: [WEWallpaper] {

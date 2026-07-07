@@ -2,6 +2,7 @@
 .index-build
 DerivedData
 /.previous-build
+/.steamcmd/
 xcuserdata
 .DS_Store
 *~
@@ -11,6 +12,9 @@ xcuserdata
 *.xcscmblueprint
 /default.profraw
 *.xcodeproj
+!Open Wallpaper Engine.xcodeproj/
+Open Wallpaper Engine.xcodeproj/*
+!Open Wallpaper Engine.xcodeproj/project.pbxproj
 Utilities/Docker/*.tar.gz
 .swiftpm
 Package.resolved
@@ -22,3 +26,5 @@ Utilities/InstalledSwiftPMConfiguration/config.json
 .devcontainer
 xcschememanagement.plist
 *.xcscheme
+
+*.mp4

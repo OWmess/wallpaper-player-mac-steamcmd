@@ -26,6 +26,7 @@ Menu
   - [Usage](#usage)
     - [Import from Wallpaper Engine (on Steam)](#import-from-wallpaper-engine-on-steam)
       - [Notice](#notice)
+    - [Browse and download from Steam Workshop](#browse-and-download-from-steam-workshop)
   - [Build](#build)
     - [Prerequisite](#prerequisite)
   - [Documentation](#documentation)
@@ -73,6 +74,21 @@ A normal wallpaper folder should like this (video wallpaper):
 
 #### Notice
 So far, only format from Wallpaper Engine is supported. That means you can't directly drag a `.mp4` file in and let it animate your desktop screen. We'll fix that soon.
+
+### Browse and download from Steam Workshop
+
+Open the Workshop browser in the Discover tab to view Wallpaper Engine Workshop items in app. Browsing requires a Steam Web API key from [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey); the app stores this key in Keychain and shows the same link in Settings.
+
+SteamCMD is installed automatically when you enter the Workshop page. Debug builds prefer a project-local `./.steamcmd/` directory, `OWE_STEAMCMD_DIR` can override the path, and non-writable environments fall back to Application Support. Downloads use `workshop_download_item` only, so they do not subscribe or unsubscribe your Steam account.
+
+Manual SteamCMD setup for development or troubleshooting:
+
+```sh
+mkdir -p .steamcmd
+cd .steamcmd
+curl -sqL "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz" | tar zxvf -
+./steamcmd.sh +@sSteamCmdForcePlatformType windows +login anonymous +workshop_download_item 431960 <publishedfileid> +quit
+```
 
 
 ## Build

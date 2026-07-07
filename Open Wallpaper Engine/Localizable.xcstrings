@@ -385,6 +385,9 @@
         }
       }
     },
+    "Browse" : {
+
+    },
     "Browse All By" : {
       "localizations" : {
         "zh-Hans" : {
@@ -414,6 +417,9 @@
           }
         }
       }
+    },
+    "Browse Workshop to select a wallpaper." : {
+
     },
     "Cancel" : {
       "localizations" : {
@@ -454,6 +460,9 @@
           }
         }
       }
+    },
+    "Clear Steam Session" : {
+
     },
     "Close Window" : {
       "localizations" : {
@@ -565,6 +574,9 @@
         }
       }
     },
+    "Diagnostics" : {
+
+    },
     "Disabled" : {
       "localizations" : {
         "zh-Hans" : {
@@ -614,6 +626,15 @@
           }
         }
       }
+    },
+    "Download" : {
+
+    },
+    "Download & Apply" : {
+
+    },
+    "Downloading" : {
+
     },
     "Dual Monitor" : {
       "localizations" : {
@@ -767,6 +788,12 @@
         }
       }
     },
+    "Get a Steam Web API key at steamcommunity.com/dev/apikey, then paste it here to enable in-app Workshop browsing." : {
+
+    },
+    "Get API Key" : {
+
+    },
     "Group" : {
       "localizations" : {
         "zh-Hans" : {
@@ -897,6 +924,9 @@
         }
       }
     },
+    "Install" : {
+
+    },
     "Installed" : {
       "localizations" : {
         "zh-Hans" : {
@@ -986,6 +1016,9 @@
           }
         }
       }
+    },
+    "Loading" : {
+
     },
     "Log Level" : {
       "localizations" : {
@@ -1228,6 +1261,9 @@
         }
       }
     },
+    "Open in Steam" : {
+
+    },
     "Open in Workshop" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1237,6 +1273,12 @@
           }
         }
       }
+    },
+    "Open Runtime" : {
+
+    },
+    "Open SteamCMD runtime folder" : {
+
     },
     "Open Wallpaper" : {
       "localizations" : {
@@ -1267,6 +1309,12 @@
           }
         }
       }
+    },
+    "Open Workshop" : {
+
+    },
+    "Open Workshop page" : {
+
     },
     "Opening Unkown %@" : {
       "localizations" : {
@@ -1591,6 +1639,9 @@
         }
       }
     },
+    "Repair" : {
+
+    },
     "Report" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1661,6 +1712,12 @@
         }
       }
     },
+    "Reset Runtime" : {
+
+    },
+    "Reset SteamCMD runtime" : {
+
+    },
     "Resolution" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1680,6 +1737,9 @@
           }
         }
       }
+    },
+    "Run diagnostics" : {
+
     },
     "Safe start after hibernation" : {
       "extractionState" : "stale",
@@ -1731,6 +1791,9 @@
           }
         }
       }
+    },
+    "Search Workshop" : {
+
     },
     "Select All" : {
       "localizations" : {
@@ -1822,6 +1885,9 @@
         }
       }
     },
+    "Sort" : {
+
+    },
     "Source" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1831,6 +1897,9 @@
           }
         }
       }
+    },
+    "Source: %@" : {
+
     },
     "Split" : {
       "localizations" : {
@@ -1851,6 +1920,27 @@
           }
         }
       }
+    },
+    "Steam Guard" : {
+
+    },
+    "Steam Login" : {
+
+    },
+    "Steam password, not saved" : {
+
+    },
+    "Steam username" : {
+
+    },
+    "Steam Web API Key" : {
+
+    },
+    "SteamCMD" : {
+
+    },
+    "SteamCMD must be ready before downloading" : {
+
     },
     "Stop (free memory)" : {
       "localizations" : {
@@ -1911,6 +2001,12 @@
           }
         }
       }
+    },
+    "The app manages SteamCMD in a private runtime and executes it through the bundled runner. Clearing the session removes SteamCMD login state but keeps downloaded Workshop content." : {
+
+    },
+    "The app stores this username only. Steam passwords stay in the download form for one run and are not saved by Open Wallpaper Engine." : {
+
     },
     "Theme" : {
       "localizations" : {
@@ -2251,6 +2347,12 @@
           }
         }
       }
+    },
+    "Workshop Browse" : {
+
+    },
+    "Workshop URL or ID" : {
+
     },
     "You are about to open an external %@ as a wallpaper:" : {
       "localizations" : {
