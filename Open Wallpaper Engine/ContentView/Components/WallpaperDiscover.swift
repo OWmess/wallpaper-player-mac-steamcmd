@@ -89,20 +89,28 @@ private struct WorkshopBrowseSession {
     }
 
     private mutating func takeLatestPageItems(limit: Int) -> [SteamWorkshopItem] {
-        let selected = streams
+        let bufferedItems = streams
             .flatMap(\.bufferedItems)
+            .sorted { $0.arrivalOrder < $1.arrivalOrder }
+        let sortedTimedItems = bufferedItems
+            .filter { $0.item.timeCreated != nil }
             .sorted { left, right in
-                switch (left.item.timeCreated, right.item.timeCreated) {
-                case let (leftTime?, rightTime?):
+                let leftTime = left.item.timeCreated ?? 0
+                let rightTime = right.item.timeCreated ?? 0
+                if leftTime != rightTime {
                     return leftTime > rightTime
-                case (_?, nil):
-                    return true
-                case (nil, _?):
-                    return false
-                case (nil, nil):
-                    return left.arrivalOrder < right.arrivalOrder
                 }
+                return left.arrivalOrder < right.arrivalOrder
             }
+        var timedIndex = 0
+        let orderedItems = bufferedItems.map { bufferedItem in
+            guard bufferedItem.item.timeCreated != nil else {
+                return bufferedItem
+            }
+            defer { timedIndex += 1 }
+            return sortedTimedItems[timedIndex]
+        }
+        let selected = orderedItems
             .prefix(limit)
         let selectedIDs = Set(selected.map(\.item.id))
         for index in streams.indices {

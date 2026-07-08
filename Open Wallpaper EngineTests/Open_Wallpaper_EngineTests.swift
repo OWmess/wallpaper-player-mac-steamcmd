@@ -448,6 +448,76 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(viewModel.items.map(\.id), ["1002", "2001", "1001", "2002"])
     }
 
+    @MainActor
+    func testWorkshopBrowserKeepsLatestArrivalOrderWhenTimeCreatedIsMissing() async throws {
+        let httpClient = FakeSteamWorkshopHTTPClient(responses: [
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "1001", title: "Untimed Video", type: "video")
+                ]
+            ),
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "2001", title: "Timed Web", type: "web", timeCreated: 999)
+                ]
+            )
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = SteamWorkshopBrowserViewModel(
+            apiService: SteamWorkshopAPIService(httpClient: httpClient),
+            steamCMDResolution: SteamCMDPathResolution(
+                paths: SteamCMDPaths(applicationSupportDirectory: root),
+                source: .managedRuntime,
+                legacyPaths: []
+            )
+        )
+        viewModel.apiKey = "steam-api-key"
+        viewModel.sort = .latest
+
+        await viewModel.browse()
+
+        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001"])
+    }
+
+    @MainActor
+    func testWorkshopBrowserKeepsLatestArrivalOrderForEqualTimeCreated() async throws {
+        let httpClient = FakeSteamWorkshopHTTPClient(responses: [
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "1001", title: "First Video", type: "video", timeCreated: 500)
+                ]
+            ),
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "2001", title: "Second Web", type: "web", timeCreated: 500)
+                ]
+            )
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = SteamWorkshopBrowserViewModel(
+            apiService: SteamWorkshopAPIService(httpClient: httpClient),
+            steamCMDResolution: SteamCMDPathResolution(
+                paths: SteamCMDPaths(applicationSupportDirectory: root),
+                source: .managedRuntime,
+                legacyPaths: []
+            )
+        )
+        viewModel.apiKey = "steam-api-key"
+        viewModel.sort = .latest
+
+        await viewModel.browse()
+
+        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001"])
+    }
+
     func testSteamCMDDownloadArgumentsForceWindowsAndNeverSubscribe() {
         let command = SteamCMDDownloadCommand(
             itemID: "3004222851",

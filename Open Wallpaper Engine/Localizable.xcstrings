@@ -1178,7 +1178,14 @@
       }
     },
     "Next page" : {
-
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下一页"
+          }
+        }
+      }
     },
     "No Tags" : {
       "localizations" : {
@@ -1354,10 +1361,24 @@
       }
     },
     "Page" : {
-
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "页"
+          }
+        }
+      }
     },
     "Page %lld" : {
-
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "第 %lld 页"
+          }
+        }
+      }
     },
     "Paste" : {
       "localizations" : {
@@ -1502,7 +1523,14 @@
       }
     },
     "Previous page" : {
-
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上一页"
+          }
+        }
+      }
     },
     "Proceed" : {
       "localizations" : {
