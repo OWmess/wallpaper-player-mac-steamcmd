@@ -472,12 +472,17 @@ private struct SteamWorkshopQueryRequestPayload: Encodable {
     }
 
     init(query: SteamWorkshopQuery) {
-        self.queryType = query.sort.queryType
-        self.numPerPage = query.pageSize
-        self.cursor = query.cursor?.isEmpty == false ? query.cursor : nil
-        self.searchText = query.searchText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            ? query.searchText
-            : nil
+        let trimmedSearch = query.searchText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTag = query.requiredTag?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        creatorAppID = query.creatorAppID
+        queryType = query.sort.queryType
+        numPerPage = query.pageSize
+        cursor = query.cursor?.isEmpty == false ? query.cursor! : "*"
+        requiredTag = trimmedTag?.isEmpty == false ? trimmedTag : nil
+        matchAllTags = query.matchAllTags
+        searchText = trimmedSearch?.isEmpty == false ? trimmedSearch : nil
+        days = query.days ?? (query.sort == .trending ? 7 : nil)
     }
 }
 
