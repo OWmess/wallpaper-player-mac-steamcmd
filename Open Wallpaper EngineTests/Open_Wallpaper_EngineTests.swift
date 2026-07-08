@@ -375,6 +375,79 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(httpClient.requiredTags, ["Video", "Web"])
     }
 
+    @MainActor
+    func testWorkshopBrowserDisablesNextPageAfterFinalPartialTypedPage() async throws {
+        let httpClient = FakeSteamWorkshopHTTPClient(responses: [
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "1001", title: "Video One", type: "video")
+                ]
+            ),
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "2001", title: "Web One", type: "web")
+                ]
+            )
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = SteamWorkshopBrowserViewModel(
+            apiService: SteamWorkshopAPIService(httpClient: httpClient),
+            steamCMDResolution: SteamCMDPathResolution(
+                paths: SteamCMDPaths(applicationSupportDirectory: root),
+                source: .managedRuntime,
+                legacyPaths: []
+            )
+        )
+        viewModel.apiKey = "steam-api-key"
+
+        await viewModel.browse()
+
+        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001"])
+        XCTAssertFalse(viewModel.canLoadNextPage)
+        XCTAssertEqual(viewModel.statusMessage, "Loaded page 1 with 2 playable Workshop items.")
+    }
+
+    @MainActor
+    func testWorkshopBrowserSortsLatestMergedPageByTimeCreated() async throws {
+        let httpClient = FakeSteamWorkshopHTTPClient(responses: [
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "1001", title: "Older Video", type: "video", timeCreated: 100),
+                    Self.workshopItemJSON(id: "1002", title: "Newest Video", type: "video", timeCreated: 400)
+                ]
+            ),
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "2001", title: "Middle Web", type: "web", timeCreated: 300),
+                    Self.workshopItemJSON(id: "2002", title: "Oldest Web", type: "web", timeCreated: 50)
+                ]
+            )
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = SteamWorkshopBrowserViewModel(
+            apiService: SteamWorkshopAPIService(httpClient: httpClient),
+            steamCMDResolution: SteamCMDPathResolution(
+                paths: SteamCMDPaths(applicationSupportDirectory: root),
+                source: .managedRuntime,
+                legacyPaths: []
+            )
+        )
+        viewModel.apiKey = "steam-api-key"
+        viewModel.sort = .latest
+
+        await viewModel.browse()
+
+        XCTAssertEqual(viewModel.items.map(\.id), ["1002", "2001", "1001", "2002"])
+    }
+
     func testSteamCMDDownloadArgumentsForceWindowsAndNeverSubscribe() {
         let command = SteamCMDDownloadCommand(
             itemID: "3004222851",
@@ -1933,11 +2006,12 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         """.data(using: .utf8)!
     }
 
-    private static func workshopItemJSON(id: String, title: String, type: String) -> String {
+    private static func workshopItemJSON(id: String, title: String, type: String, timeCreated: Int? = nil) -> String {
         """
         {
           "publishedfileid": "\(id)",
           "title": "\(title)",
+          \(timeCreated.map { "\"time_created\": \($0)," } ?? "")
           "metadata": "{\\"type\\":\\"\(type)\\"}",
           "tags": [
             { "tag": "\(type)" }
