@@ -218,6 +218,16 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(SteamWorkshopQuery.Sort.search.queryType, 12)
     }
 
+    func testWorkshopBrowserLayoutPolicyKeepsWideDetailAdaptive() {
+        let wideLayout = SteamWorkshopBrowserLayoutPolicy.layout(forWidth: 1100, height: 700)
+        XCTAssertEqual(wideLayout.presentation, .sideBySide)
+        XCTAssertGreaterThanOrEqual(wideLayout.detailWidthRange.upperBound, 480)
+
+        let compactLayout = SteamWorkshopBrowserLayoutPolicy.layout(forWidth: 720, height: 700)
+        XCTAssertEqual(compactLayout.presentation, .stacked)
+        XCTAssertEqual(compactLayout.listHeight, 385)
+    }
+
     func testWorkshopTrendingRequestIncludesDefaultDays() throws {
         let request = try SteamWorkshopAPIService.makeQueryRequest(
             apiKey: "steam-api-key",

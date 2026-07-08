@@ -81,6 +81,36 @@ private struct WorkshopBrowseFetchResult {
     var page: WorkshopBrowsePage
 }
 
+struct SteamWorkshopBrowserLayoutPolicy {
+    enum Presentation: Equatable {
+        case sideBySide
+        case stacked
+    }
+
+    struct Layout: Equatable {
+        var presentation: Presentation
+        var detailWidthRange: ClosedRange<CGFloat>
+        var listHeight: CGFloat
+    }
+
+    static func layout(forWidth width: CGFloat, height: CGFloat) -> Layout {
+        if width >= 860 {
+            let maxDetailWidth = min(max(width * 0.42, 480), 620)
+            return Layout(
+                presentation: .sideBySide,
+                detailWidthRange: 320...maxDetailWidth,
+                listHeight: height
+            )
+        }
+
+        return Layout(
+            presentation: .stacked,
+            detailWidthRange: 0...width,
+            listHeight: max(260, (height * 0.55).rounded())
+        )
+    }
+}
+
 struct WallpaperDiscover: View {
     var body: some View {
         ScrollView {
@@ -448,6 +478,7 @@ struct SteamWorkshopBrowser: View {
     @ObservedObject var contentViewModel: ContentViewModel
     @ObservedObject var wallpaperViewModel: WallpaperViewModel
     @StateObject private var viewModel = SteamWorkshopBrowserViewModel()
+    @State private var isAdvancedControlsExpanded = false
 
     private let columns = [
         GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 12)
@@ -456,10 +487,12 @@ struct SteamWorkshopBrowser: View {
     var body: some View {
         GeometryReader { proxy in
             VStack(alignment: .leading, spacing: 12) {
-                apiKeyBar
-                steamCMDStatusBar
-                browserToolbar
-                manualDownloadBar
+                primaryToolbar
+
+                if isAdvancedControlsExpanded {
+                    advancedControlsPanel
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
 
                 if !viewModel.statusMessage.isEmpty {
                     Label(viewModel.statusMessage, systemImage: "info.circle")
@@ -473,13 +506,12 @@ struct SteamWorkshopBrowser: View {
             }
             .padding(.top, 8)
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
-            .clipped()
         }
         .onAppear {
             viewModel.refreshSteamCMDResolution()
             viewModel.loadAPIKey()
             if viewModel.apiKey.isEmpty {
-                viewModel.statusMessage = "Paste a Steam Web API key to browse here, or use a Workshop URL/ID to download directly."
+                viewModel.statusMessage = "Open Advanced to paste a Steam Web API key, or download directly with a Workshop URL/ID."
             } else if viewModel.items.isEmpty {
                 Task { await viewModel.browse() }
             }
@@ -488,18 +520,23 @@ struct SteamWorkshopBrowser: View {
 
     private var workshopContent: some View {
         GeometryReader { proxy in
-            if proxy.size.width >= 820 {
+            let layout = SteamWorkshopBrowserLayoutPolicy.layout(forWidth: proxy.size.width, height: proxy.size.height)
+
+            if layout.presentation == .sideBySide {
                 HSplitView {
                     workshopList
                         .frame(minWidth: 420)
                     workshopDetail
-                        .frame(minWidth: 260, maxWidth: 340)
+                        .frame(
+                            minWidth: layout.detailWidthRange.lowerBound,
+                            idealWidth: layout.detailWidthRange.upperBound,
+                            maxWidth: layout.detailWidthRange.upperBound
+                        )
                 }
             } else {
-                let listHeight = max(240, proxy.size.height * 0.55)
                 VStack(alignment: .leading, spacing: 12) {
                     workshopList
-                        .frame(height: listHeight)
+                        .frame(height: layout.listHeight)
                     Divider()
                     workshopDetail
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -525,7 +562,32 @@ struct SteamWorkshopBrowser: View {
                 }
                 .padding(.vertical, 4)
             }
-            workshopPaginationBar
+        }
+    }
+
+    private var primaryToolbar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                sortPicker
+                searchControls
+                    .layoutPriority(1)
+                workshopPaginationBar
+                Spacer(minLength: 8)
+                advancedToggleButton
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    searchControls
+                    Spacer(minLength: 8)
+                    advancedToggleButton
+                }
+                HStack(spacing: 8) {
+                    sortPicker
+                    workshopPaginationBar
+                    Spacer()
+                }
+            }
         }
     }
 
@@ -556,11 +618,32 @@ struct SteamWorkshopBrowser: View {
                 ProgressView()
                     .controlSize(.small)
             }
-
-            Spacer()
         }
         .buttonStyle(.borderless)
-        .padding(.top, 2)
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var advancedToggleButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) {
+                isAdvancedControlsExpanded.toggle()
+            }
+        } label: {
+            Label(isAdvancedControlsExpanded ? "Hide Advanced" : "Advanced", systemImage: "slider.horizontal.3")
+        }
+        .help(isAdvancedControlsExpanded ? "Hide advanced controls" : "Show advanced controls")
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var advancedControlsPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            apiKeyBar
+            Divider()
+            steamCMDStatusBar
+            Divider()
+            manualDownloadBar
+        }
+        .padding(.vertical, 2)
     }
 
     private var workshopDetail: some View {
@@ -609,19 +692,6 @@ struct SteamWorkshopBrowser: View {
             VStack(alignment: .leading, spacing: 8) {
                 apiKeyField
                 apiKeyActions
-            }
-        }
-    }
-
-    private var browserToolbar: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) {
-                sortPicker
-                searchControls
-            }
-            VStack(alignment: .leading, spacing: 8) {
-                sortPicker
-                searchControls
             }
         }
     }
@@ -729,7 +799,7 @@ struct SteamWorkshopBrowser: View {
             }
         }
         .pickerStyle(.segmented)
-        .frame(width: 360)
+        .frame(width: 320)
     }
 
     private var searchControls: some View {
@@ -890,62 +960,69 @@ private struct WorkshopDetailPane: View {
     let openInSteam: (SteamWorkshopItem) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let item {
-                AsyncImage(url: item.previewURL) { image in
-                    image.resizable().scaledToFill()
-                } placeholder: {
-                    Image("we.placeholder")
-                        .resizable()
-                        .scaledToFit()
-                        .padding(36)
-                }
-                .frame(height: 170)
-                .frame(maxWidth: .infinity)
-                .clipped()
-                .background(Color.secondary.opacity(0.12))
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if let item {
+                    AsyncImage(url: item.previewURL) { image in
+                        image.resizable().scaledToFill()
+                    } placeholder: {
+                        Image("we.placeholder")
+                            .resizable()
+                            .scaledToFit()
+                            .padding(36)
+                    }
+                    .frame(height: 190)
+                    .frame(maxWidth: .infinity)
+                    .clipped()
+                    .background(Color.secondary.opacity(0.12))
 
-                Text(item.title)
-                    .font(.title3)
-                    .fontWeight(.semibold)
-                    .lineLimit(3)
+                    Text(item.title)
+                        .font(.title3)
+                        .fontWeight(.semibold)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                ScrollView {
                     Text(item.fileDescription?.plainWorkshopText ?? "No description")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(minHeight: 90)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                Text(item.tags.joined(separator: " / "))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
+                    Text(item.tags.joined(separator: " / "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                HStack {
-                    Button {
-                        download(item)
-                    } label: {
-                        Label("Download & Apply", systemImage: "arrow.down.circle.fill")
+                    HStack {
+                        Button {
+                            download(item)
+                        } label: {
+                            Label("Download & Apply", systemImage: "arrow.down.circle.fill")
+                        }
+                        .disabled(isDownloading || !canDownload)
+
+                        Button {
+                            openInSteam(item)
+                        } label: {
+                            Image(systemName: "safari")
+                        }
+                        .help("Open in Steam")
+
+                        Spacer()
                     }
-                    .disabled(isDownloading || !canDownload)
-
-                    Button {
-                        openInSteam(item)
-                    } label: {
-                        Image(systemName: "safari")
-                    }
-                    .help("Open in Steam")
+                } else {
+                    Spacer(minLength: 80)
+                    Label("Browse Workshop to select a wallpaper.", systemImage: "photo.on.rectangle.angled")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                    Spacer(minLength: 80)
                 }
-            } else {
-                Spacer()
-                Label("Browse Workshop to select a wallpaper.", systemImage: "photo.on.rectangle.angled")
-                    .foregroundStyle(.secondary)
-                Spacer()
             }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(.leading, 10)
+            .padding(.bottom, 8)
         }
-        .padding(.leading, 10)
     }
 }
 
