@@ -5,7 +5,19 @@ final class SteamCMDRunnerService: NSObject, SteamCMDRunnerXPCProtocol {
         Task.detached {
             let core = SteamCMDRunnerService.core(runtimePath: runtimePath)
             do {
-                let result = try await core.installIfNeeded()
+                let result = try await core.installIfMissing()
+                reply(SteamCMDRunnerXPCPayload.success(result))
+            } catch {
+                reply(SteamCMDRunnerXPCPayload.failure(error))
+            }
+        }
+    }
+
+    func repair(runtimePath: String, reply: @escaping (NSDictionary) -> Void) {
+        Task.detached {
+            let core = SteamCMDRunnerService.core(runtimePath: runtimePath)
+            do {
+                let result = try await core.repairRuntime()
                 reply(SteamCMDRunnerXPCPayload.success(result))
             } catch {
                 reply(SteamCMDRunnerXPCPayload.failure(error))

@@ -461,9 +461,6 @@
         }
       }
     },
-    "Clear Steam Session" : {
-
-    },
     "Close Window" : {
       "localizations" : {
         "zh-Hans" : {
@@ -573,9 +570,6 @@
           }
         }
       }
-    },
-    "Diagnostics" : {
-
     },
     "Disabled" : {
       "localizations" : {
@@ -1030,6 +1024,9 @@
         }
       }
     },
+    "Login" : {
+
+    },
     "Low" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1273,9 +1270,6 @@
           }
         }
       }
-    },
-    "Open Runtime" : {
-
     },
     "Open SteamCMD runtime folder" : {
 
@@ -1712,9 +1706,6 @@
         }
       }
     },
-    "Reset Runtime" : {
-
-    },
     "Reset SteamCMD runtime" : {
 
     },
@@ -2002,10 +1993,10 @@
         }
       }
     },
-    "The app manages SteamCMD in a private runtime and executes it through the bundled runner. Clearing the session removes SteamCMD login state but keeps downloaded Workshop content." : {
+    "The app manages SteamCMD in a private runtime and executes the SteamCMD binary through the bundled runner. Install only creates missing files; Repair runs SteamCMD's own check/update. Clearing the session removes SteamCMD login state but keeps downloaded Workshop content." : {
 
     },
-    "The app stores this username only. Steam passwords stay in the download form for one run and are not saved by Open Wallpaper Engine." : {
+    "The app stores this username only. Steam passwords stay in the download form for one run and are not saved by Open Wallpaper Engine. Saved Session reuses SteamCMD's own login files in the runtime." : {
 
     },
     "Theme" : {

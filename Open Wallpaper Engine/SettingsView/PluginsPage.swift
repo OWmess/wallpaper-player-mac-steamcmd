@@ -48,7 +48,7 @@ struct PluginsPage: SettingsPage {
 
             Section {
                 TextField("Steam username", text: $steamUsername)
-                Text("The app stores this username only. Steam passwords stay in the download form for one run and are not saved by Open Wallpaper Engine.")
+                Text("The app stores this username only. Steam passwords stay in the download form for one run and are not saved by Open Wallpaper Engine. Saved Session reuses SteamCMD's own login files in the runtime.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {
@@ -57,46 +57,20 @@ struct PluginsPage: SettingsPage {
 
             Section {
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack {
+                    HStack(alignment: .top) {
                         Label(installState.statusText, systemImage: installState.systemImage)
                             .foregroundStyle(installState.tint)
                         Spacer()
-                        Button {
-                            installSteamCMD()
-                        } label: {
-                            Label(installState.isInstalled ? "Repair" : "Install", systemImage: "arrow.clockwise")
-                        }
-                        .disabled(installState.isBusy)
-                        Button {
-                            openSteamCMDRuntimeFolder()
-                        } label: {
-                            Label("Open Runtime", systemImage: "folder")
-                        }
-                        Button {
-                            runSteamCMDDiagnostics()
-                        } label: {
-                            Label("Diagnostics", systemImage: "stethoscope")
-                        }
-                        Button(role: .destructive) {
-                            resetSteamCMDRuntime()
-                        } label: {
-                            Label("Reset Runtime", systemImage: "trash")
-                        }
-                        .disabled(installState.isBusy)
-                        Button(role: .destructive) {
-                            clearSteamSession()
-                        } label: {
-                            Label("Clear Steam Session", systemImage: "rectangle.portrait.and.arrow.right")
-                        }
                     }
+                    steamCMDActionButtons
                     Text(steamCMDDirectoryStatusText)
                         .font(.caption)
                         .textSelection(.enabled)
-                Text("Source: \(steamCMDResolution.source.label)")
+                    Text("Source: \(steamCMDResolution.source.label)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text("The app manages SteamCMD in a private runtime and executes it through the bundled runner. Clearing the session removes SteamCMD login state but keeps downloaded Workshop content.")
+                Text("The app manages SteamCMD in a private runtime and executes the SteamCMD binary through the bundled runner. Install only creates missing files; Repair runs SteamCMD's own check/update. Clearing the session removes SteamCMD login state but keeps downloaded Workshop content.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {
@@ -133,12 +107,62 @@ struct PluginsPage: SettingsPage {
         }
     }
 
+    private var steamCMDActionButtons: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Button {
+                    installSteamCMD()
+                } label: {
+                    steamCMDActionLabel(installState.isInstalled ? "Repair" : "Install", systemImage: "arrow.clockwise")
+                }
+                .disabled(installState.isBusy)
+
+                Button {
+                    openSteamCMDRuntimeFolder()
+                } label: {
+                    steamCMDActionLabel("Open Runtime", systemImage: "folder")
+                }
+
+                Button {
+                    runSteamCMDDiagnostics()
+                } label: {
+                    steamCMDActionLabel("Diagnostics", systemImage: "stethoscope")
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button(role: .destructive) {
+                    resetSteamCMDRuntime()
+                } label: {
+                    steamCMDActionLabel("Reset Runtime", systemImage: "trash")
+                }
+                .disabled(installState.isBusy)
+
+                Button(role: .destructive) {
+                    clearSteamSession()
+                } label: {
+                    steamCMDActionLabel("Clear Steam Session", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+            }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.regular)
+    }
+
+    private func steamCMDActionLabel(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
     private func clearSteamSession() {
-        do {
-            try steamCMDService.clearLoginSession()
-            statusMessage = "SteamCMD session cleared. Downloaded Workshop files were kept."
-        } catch {
-            statusMessage = error.localizedDescription
+        Task {
+            do {
+                try await steamCMDService.clearLoginSession()
+                statusMessage = "SteamCMD session cleared. Downloaded Workshop files were kept."
+            } catch {
+                statusMessage = error.localizedDescription
+            }
         }
     }
 
@@ -159,7 +183,8 @@ struct PluginsPage: SettingsPage {
             installState = .idle
             return
         }
-        if FileManager.default.fileExists(atPath: steamCMDService.paths.executableURL.path) {
+        if FileManager.default.fileExists(atPath: steamCMDService.paths.executableURL.path),
+           FileManager.default.fileExists(atPath: steamCMDService.paths.steamCMDExecutableURL.path) {
             installState = .installed(steamCMDService.paths.executableURL)
         } else {
             installState = .idle
@@ -169,13 +194,22 @@ struct PluginsPage: SettingsPage {
     private func installSteamCMD() {
         Task {
             do {
-                try await steamCMDService.installIfNeeded { state in
-                    Task { @MainActor in
-                        installState = state
+                let shouldRepair = installState.isInstalled
+                if shouldRepair {
+                    try await steamCMDService.repairRuntime { state in
+                        Task { @MainActor in
+                            installState = state
+                        }
+                    }
+                } else {
+                    try await steamCMDService.installIfMissing { state in
+                        Task { @MainActor in
+                            installState = state
+                        }
                     }
                 }
                 installState = .installed(steamCMDService.paths.executableURL)
-                statusMessage = "SteamCMD is ready."
+                statusMessage = shouldRepair ? "SteamCMD runtime repaired." : "SteamCMD is ready."
             } catch {
                 installState = .failed(error.localizedDescription)
                 statusMessage = installState.statusText

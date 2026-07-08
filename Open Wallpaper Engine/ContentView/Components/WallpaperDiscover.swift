@@ -24,6 +24,7 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
     @Published var sort = SteamWorkshopQuery.Sort.popular
     @Published var searchText = ""
     @Published var manualItemInput = ""
+    @Published var loginMode = SteamWorkshopLoginMode.anonymous
     @Published var username = UserDefaults.standard.string(forKey: "SteamWorkshopUsername") ?? ""
     @Published var password = ""
     @Published var steamGuardCode = ""
@@ -100,7 +101,8 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
             installState = .idle
             return
         }
-        if FileManager.default.fileExists(atPath: steamCMDService.paths.executableURL.path) {
+        if FileManager.default.fileExists(atPath: steamCMDService.paths.executableURL.path),
+           FileManager.default.fileExists(atPath: steamCMDService.paths.steamCMDExecutableURL.path) {
             installState = .installed(steamCMDService.paths.executableURL)
         } else {
             installState = .idle
@@ -166,12 +168,30 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
     @discardableResult
     func ensureSteamCMDInstalled() async -> Bool {
         do {
-            try await steamCMDService.installIfNeeded { [weak self] state in
+            try await steamCMDService.installIfMissing { [weak self] state in
                 Task { @MainActor in
                     self?.installState = state
                 }
             }
             installState = .installed(steamCMDService.paths.executableURL)
+            return true
+        } catch {
+            installState = .failed(error.localizedDescription)
+            statusMessage = installState.statusText
+            return false
+        }
+    }
+
+    @discardableResult
+    func repairSteamCMDRuntime() async -> Bool {
+        do {
+            try await steamCMDService.repairRuntime { [weak self] state in
+                Task { @MainActor in
+                    self?.installState = state
+                }
+            }
+            installState = .installed(steamCMDService.paths.executableURL)
+            statusMessage = "SteamCMD runtime repaired."
             return true
         } catch {
             installState = .failed(error.localizedDescription)
@@ -196,6 +216,7 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
             UserDefaults.standard.set(username, forKey: "SteamWorkshopUsername")
             let input = SteamWorkshopDownloadInput(
                 itemInput: overrideItemID ?? manualItemInput,
+                loginMode: loginMode,
                 username: username,
                 password: password,
                 steamGuardCode: steamGuardCode
@@ -260,52 +281,27 @@ struct SteamWorkshopBrowser: View {
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            apiKeyBar
-            steamCMDStatusBar
-            browserToolbar
-            manualDownloadBar
+        GeometryReader { proxy in
+            VStack(alignment: .leading, spacing: 12) {
+                apiKeyBar
+                steamCMDStatusBar
+                browserToolbar
+                manualDownloadBar
 
-            if !viewModel.statusMessage.isEmpty {
-                Label(viewModel.statusMessage, systemImage: "info.circle")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-
-            HSplitView {
-                ScrollView {
-                    LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
-                        ForEach(viewModel.items) { item in
-                            WorkshopItemCard(
-                                item: item,
-                                isSelected: viewModel.selectedItem?.id == item.id,
-                                isDownloading: viewModel.isDownloading,
-                                canDownload: viewModel.canStartDownload
-                            ) {
-                                viewModel.selectedItem = item
-                            } download: {
-                                download(itemID: item.id)
-                            } openInSteam: {
-                                viewModel.openWorkshopPage(for: item)
-                            }
-                        }
-                    }
-                    .padding(.vertical, 4)
+                if !viewModel.statusMessage.isEmpty {
+                    Label(viewModel.statusMessage, systemImage: "info.circle")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
-                .frame(minWidth: 520)
 
-                WorkshopDetailPane(
-                    item: viewModel.selectedItem,
-                    isDownloading: viewModel.isDownloading,
-                    canDownload: viewModel.canStartDownload,
-                    download: { item in download(itemID: item.id) },
-                    openInSteam: { item in viewModel.openWorkshopPage(for: item) }
-                )
-                .frame(minWidth: 260, maxWidth: 340)
+                workshopContent
+                    .layoutPriority(1)
             }
+            .padding(.top, 8)
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            .clipped()
         }
-        .padding(.top, 8)
         .onAppear {
             viewModel.refreshSteamCMDResolution()
             viewModel.loadAPIKey()
@@ -318,24 +314,161 @@ struct SteamWorkshopBrowser: View {
         }
     }
 
+    private var workshopContent: some View {
+        GeometryReader { proxy in
+            if proxy.size.width >= 820 {
+                HSplitView {
+                    workshopList
+                        .frame(minWidth: 420)
+                    workshopDetail
+                        .frame(minWidth: 260, maxWidth: 340)
+                }
+            } else {
+                let listHeight = max(240, proxy.size.height * 0.55)
+                VStack(alignment: .leading, spacing: 12) {
+                    workshopList
+                        .frame(height: listHeight)
+                    Divider()
+                    workshopDetail
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+    }
+
+    private var workshopList: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                ForEach(viewModel.items) { item in
+                    WorkshopItemCard(
+                        item: item,
+                        isSelected: viewModel.selectedItem?.id == item.id,
+                        isDownloading: viewModel.isDownloading,
+                        canDownload: viewModel.canStartDownload
+                    ) {
+                        viewModel.selectedItem = item
+                    } download: {
+                        download(itemID: item.id)
+                    } openInSteam: {
+                        viewModel.openWorkshopPage(for: item)
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private var workshopDetail: some View {
+        WorkshopDetailPane(
+            item: viewModel.selectedItem,
+            isDownloading: viewModel.isDownloading,
+            canDownload: viewModel.canStartDownload,
+            download: { item in download(itemID: item.id) },
+            openInSteam: { item in viewModel.openWorkshopPage(for: item) }
+        )
+    }
+
     private var steamCMDStatusBar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Label(viewModel.installState.statusText, systemImage: viewModel.installState.systemImage)
+                    .foregroundStyle(viewModel.installState.tint)
+                Text(viewModel.steamCMDPathSourceText)
+                    .font(.caption2)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.secondary.opacity(0.12), in: Capsule())
+                Spacer()
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    steamCMDPathText
+                    Spacer(minLength: 12)
+                    steamCMDRuntimeActions
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    steamCMDPathText
+                    steamCMDRuntimeActions
+                }
+            }
+        }
+        .font(.footnote)
+    }
+
+    private var apiKeyBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                apiKeyField
+                apiKeyActions
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                apiKeyField
+                apiKeyActions
+            }
+        }
+    }
+
+    private var browserToolbar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                sortPicker
+                searchControls
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                sortPicker
+                searchControls
+            }
+        }
+    }
+
+    private var manualDownloadBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                manualItemField
+                loginModePicker
+                usernameField
+                passwordField
+                steamGuardField
+                manualDownloadActions
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    manualItemField
+                    manualDownloadActions
+                }
+                HStack(spacing: 8) {
+                    loginModePicker
+                    usernameField
+                }
+                HStack(spacing: 8) {
+                    passwordField
+                    steamGuardField
+                }
+            }
+        }
+    }
+
+    private var steamCMDPathText: some View {
+        Text(viewModel.steamCMDDirectoryPath)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .textSelection(.enabled)
+    }
+
+    private var steamCMDRuntimeActions: some View {
         HStack(spacing: 8) {
-            Label(viewModel.installState.statusText, systemImage: viewModel.installState.systemImage)
-                .foregroundStyle(viewModel.installState.tint)
-            Text(viewModel.steamCMDPathSourceText)
-                .font(.caption2)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.secondary.opacity(0.12), in: Capsule())
-            Text(viewModel.steamCMDDirectoryPath)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-            Spacer()
             Button {
-                Task { await viewModel.ensureSteamCMDInstalled() }
+                Task {
+                    if viewModel.installState.isInstalled {
+                        await viewModel.repairSteamCMDRuntime()
+                    } else {
+                        await viewModel.ensureSteamCMDInstalled()
+                    }
+                }
             } label: {
                 Label(viewModel.installState.isInstalled ? "Repair" : "Install", systemImage: "arrow.clockwise")
             }
@@ -360,13 +493,17 @@ struct SteamWorkshopBrowser: View {
             .help("Reset SteamCMD runtime")
             .disabled(viewModel.installState.isBusy)
         }
-        .font(.footnote)
+        .fixedSize(horizontal: true, vertical: false)
     }
 
-    private var apiKeyBar: some View {
+    private var apiKeyField: some View {
+        SecureField("Steam Web API Key", text: $viewModel.apiKey)
+            .textFieldStyle(.roundedBorder)
+            .frame(minWidth: 220)
+    }
+
+    private var apiKeyActions: some View {
         HStack(spacing: 8) {
-            SecureField("Steam Web API Key", text: $viewModel.apiKey)
-                .textFieldStyle(.roundedBorder)
             Button {
                 viewModel.saveAPIKey()
             } label: {
@@ -379,21 +516,24 @@ struct SteamWorkshopBrowser: View {
                 Label("Open Workshop", systemImage: "safari")
             }
         }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
-    private var browserToolbar: some View {
-        HStack(spacing: 8) {
-            Picker("Sort", selection: $viewModel.sort) {
-                ForEach(SteamWorkshopQuery.Sort.allCases) { sort in
-                    Text(sort.title).tag(sort)
-                }
+    private var sortPicker: some View {
+        Picker("Sort", selection: $viewModel.sort) {
+            ForEach(SteamWorkshopQuery.Sort.allCases) { sort in
+                Text(sort.title).tag(sort)
             }
-            .pickerStyle(.segmented)
-            .frame(width: 360)
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 360)
+    }
 
+    private var searchControls: some View {
+        HStack(spacing: 8) {
             TextField("Search Workshop", text: $viewModel.searchText)
                 .textFieldStyle(.roundedBorder)
-
+                .frame(minWidth: 220)
             Button {
                 Task { await viewModel.browse() }
             } label: {
@@ -403,20 +543,46 @@ struct SteamWorkshopBrowser: View {
         }
     }
 
-    private var manualDownloadBar: some View {
+    private var manualItemField: some View {
+        TextField("Workshop URL or ID", text: $viewModel.manualItemInput)
+            .textFieldStyle(.roundedBorder)
+            .frame(minWidth: 220)
+    }
+
+    private var loginModePicker: some View {
+        Picker("Login", selection: $viewModel.loginMode) {
+            ForEach(SteamWorkshopLoginMode.allCases) { mode in
+                Text(mode.title).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 330)
+    }
+
+    private var usernameField: some View {
+        TextField("Steam username", text: $viewModel.username)
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 150)
+            .disabled(viewModel.loginMode == .anonymous)
+    }
+
+    private var passwordField: some View {
+        SecureField("Steam password, not saved", text: $viewModel.password)
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 220)
+            .disabled(viewModel.loginMode != .password)
+    }
+
+    private var steamGuardField: some View {
+        TextField("Steam Guard", text: $viewModel.steamGuardCode)
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 130)
+            .disabled(viewModel.loginMode != .password)
+    }
+
+    private var manualDownloadActions: some View {
         HStack(spacing: 8) {
-            TextField("Workshop URL or ID", text: $viewModel.manualItemInput)
-                .textFieldStyle(.roundedBorder)
-                .frame(minWidth: 220)
-            TextField("Steam username", text: $viewModel.username)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 150)
-            SecureField("Steam password, not saved", text: $viewModel.password)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 180)
-            TextField("Steam Guard", text: $viewModel.steamGuardCode)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 110)
             Button {
                 download(itemID: nil)
             } label: {
@@ -432,6 +598,7 @@ struct SteamWorkshopBrowser: View {
             }
             .help("Open Workshop page")
         }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private func download(itemID: String?) {
@@ -473,7 +640,7 @@ private struct WorkshopItemCard: View {
             Text(item.title)
                 .font(.headline)
                 .lineLimit(2)
-                .frame(minHeight: 40, alignment: .topLeading)
+                .frame(minHeight: 48, alignment: .topLeading)
 
             Text(item.tags.prefix(3).joined(separator: " / "))
                 .font(.caption)

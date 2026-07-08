@@ -125,16 +125,19 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
     }
 
     func testSteamCMDOutputParserRecognizesLoginDownloadAndGuardStates() {
+        var parser = SteamCMDOutputStreamParser()
+        XCTAssertNil(parser.event(from: "Waiting for user info..."))
+        XCTAssertEqual(parser.event(from: "OK"), .loginSucceeded)
         XCTAssertEqual(
-            SteamCMDOutputParser.event(from: "Success. Downloaded item 3004222851 to \"/tmp/content/431960/3004222851\""),
+            parser.event(from: "Success. Downloaded item 3004222851 to \"/tmp/content/431960/3004222851\""),
             .downloadSucceeded(itemID: "3004222851")
         )
         XCTAssertEqual(
-            SteamCMDOutputParser.event(from: "ERROR! Download item 431960 failed (Failure)."),
+            parser.event(from: "ERROR! Download item 431960 failed (Failure)."),
             .downloadFailed
         )
         XCTAssertEqual(
-            SteamCMDOutputParser.event(from: "Steam Guard code:"),
+            parser.event(from: "Steam Guard code:"),
             .steamGuardRequired
         )
         XCTAssertEqual(
@@ -219,10 +222,20 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             itemID: "3004222851",
             login: .account(username: "alice", password: "secret", steamGuardCode: "ABCDE")
         )
+        let savedSessionCommand = SteamCMDDownloadCommand(
+            itemID: "3004222851",
+            login: .savedSession(username: "alice")
+        )
 
         XCTAssertEqual(command.arguments, [
             "+@sSteamCmdForcePlatformType", "windows",
             "+login", "alice", "secret", "ABCDE",
+            "+workshop_download_item", "431960", "3004222851",
+            "+quit"
+        ])
+        XCTAssertEqual(savedSessionCommand.arguments, [
+            "+@sSteamCmdForcePlatformType", "windows",
+            "+login", "alice",
             "+workshop_download_item", "431960", "3004222851",
             "+quit"
         ])
@@ -239,10 +252,14 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             root.appendingPathComponent("SteamCMDManaged/v1", isDirectory: true)
         )
         XCTAssertEqual(paths.executableURL, root.appendingPathComponent("SteamCMDManaged/v1/steamcmd.sh"))
+        XCTAssertEqual(paths.steamHomeDirectory, root.appendingPathComponent("SteamCMDManaged/v1/Library/Application Support/Steam", isDirectory: true))
         XCTAssertEqual(
             paths.workshopContentDirectory,
-            root.appendingPathComponent("SteamCMDManaged/v1/steamapps/workshop/content/431960", isDirectory: true)
+            root.appendingPathComponent("SteamCMDManaged/v1/Library/Application Support/Steam/steamapps/workshop/content/431960", isDirectory: true)
         )
+        XCTAssertTrue(paths.legacyWorkshopContentDirectories.contains(
+            root.appendingPathComponent("SteamCMDManaged/v1/steamapps/workshop/content/431960", isDirectory: true)
+        ))
         XCTAssertFalse(paths.loginSessionCandidateURLs().contains(paths.workshopContentDirectory))
     }
 
@@ -274,11 +291,12 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(resolution.paths.steamCMDDirectory, managedRuntime)
         XCTAssertNil(resolution.paths.securityScopedResourceURL)
         XCTAssertEqual(resolution.legacyPaths.map(\.steamCMDDirectory), [v2Runtime, legacy])
-        XCTAssertEqual(resolution.workshopContentDirectories, [
-            managedRuntime.appendingPathComponent("steamapps/workshop/content/431960", isDirectory: true),
-            v2Runtime.appendingPathComponent("steamapps/workshop/content/431960", isDirectory: true),
-            legacy.appendingPathComponent("steamapps/workshop/content/431960", isDirectory: true)
-        ])
+        XCTAssertEqual(resolution.workshopContentDirectories.first, managedRuntime.appendingPathComponent("Library/Application Support/Steam/steamapps/workshop/content/431960", isDirectory: true))
+        XCTAssertTrue(resolution.workshopContentDirectories.contains(managedRuntime.appendingPathComponent("steamapps/workshop/content/431960", isDirectory: true)))
+        XCTAssertTrue(resolution.workshopContentDirectories.contains(v2Runtime.appendingPathComponent("Library/Application Support/Steam/steamapps/workshop/content/431960", isDirectory: true)))
+        XCTAssertTrue(resolution.workshopContentDirectories.contains(v2Runtime.appendingPathComponent("steamapps/workshop/content/431960", isDirectory: true)))
+        XCTAssertTrue(resolution.workshopContentDirectories.contains(legacy.appendingPathComponent("Library/Application Support/Steam/steamapps/workshop/content/431960", isDirectory: true)))
+        XCTAssertTrue(resolution.workshopContentDirectories.contains(legacy.appendingPathComponent("steamapps/workshop/content/431960", isDirectory: true)))
     }
 
     func testSteamCMDPathResolverDoesNotUseUserSelectedRuntimeForExecution() {
@@ -305,7 +323,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertTrue(resolution.legacyPaths.map(\.steamCMDDirectory).contains(
             runtimeRoot.appendingPathComponent("SteamCMD", isDirectory: true)
         ))
-        XCTAssertEqual(resolution.workshopContentDirectories.first, managedRuntime.appendingPathComponent("steamapps/workshop/content/431960", isDirectory: true))
+        XCTAssertEqual(resolution.workshopContentDirectories.first, managedRuntime.appendingPathComponent("Library/Application Support/Steam/steamapps/workshop/content/431960", isDirectory: true))
     }
 
     func testSteamCMDRuntimeBookmarkStoreRefreshesStaleBookmarkAndUsesResolvedURL() {
@@ -419,28 +437,39 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         )
     }
 
-    func testSteamCMDClearSessionRemovesLoginStateAndPreservesDownloads() throws {
+    func testSteamCMDClearSessionRemovesLoginStateAndPreservesDownloads() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = SteamCMDPaths(applicationSupportDirectory: root)
         let service = SteamCMDService(paths: paths)
-        let config = paths.steamCMDDirectory.appendingPathComponent("config", isDirectory: true)
-        let ssfn = paths.steamCMDDirectory.appendingPathComponent("ssfn1234567890")
+        let config = paths.steamHomeDirectory.appendingPathComponent("config", isDirectory: true)
+        let appcache = paths.steamHomeDirectory.appendingPathComponent("appcache", isDirectory: true)
+        let userdata = paths.steamHomeDirectory.appendingPathComponent("userdata", isDirectory: true)
+        let rootSSFN = paths.steamCMDDirectory.appendingPathComponent("ssfn1234567890")
+        let homeSSFN = paths.steamHomeDirectory.appendingPathComponent("ssfn0987654321")
         let downloadedItem = paths.workshopContentDirectory
             .appendingPathComponent("3004222851", isDirectory: true)
             .appendingPathComponent("project.json")
 
         try FileManager.default.createDirectory(at: config, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: appcache, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: userdata, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: downloadedItem.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("login".utf8).write(to: config.appendingPathComponent("loginusers.vdf"))
-        try Data("session".utf8).write(to: ssfn)
+        try Data("cache".utf8).write(to: appcache.appendingPathComponent("appinfo.vdf"))
+        try Data("user".utf8).write(to: userdata.appendingPathComponent("localconfig.vdf"))
+        try Data("session".utf8).write(to: rootSSFN)
+        try Data("session".utf8).write(to: homeSSFN)
         try Data("{}".utf8).write(to: downloadedItem)
 
-        try service.clearLoginSession()
+        try await service.clearLoginSession()
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: config.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: ssfn.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: appcache.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: userdata.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rootSSFN.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: homeSSFN.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: downloadedItem.path))
     }
 
@@ -528,9 +557,9 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         try writeExecutable("binary", to: paths.steamCMDExecutableURL)
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded { states.append($0) }
+        try await service.installIfMissing { states.append($0) }
 
-        XCTAssertEqual(runner.runCalls.map(\.arguments), [[paths.executableURL.path, "+quit"]])
+        XCTAssertTrue(runner.runCalls.isEmpty)
         XCTAssertEqual(states, [.checking, .installed(paths.executableURL)])
     }
 
@@ -564,6 +593,22 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
 
         XCTAssertTrue(diagnostics.isUsingXPCClient)
         XCTAssertEqual(diagnostics.runtimeURL, resolution.paths.steamCMDDirectory)
+    }
+
+    func testSteamCMDServiceClearSessionUsesConfiguredClient() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = SteamCMDPaths(applicationSupportDirectory: root)
+        let client = RecordingSteamCMDClient(paths: paths)
+        let service = SteamCMDService(
+            resolution: SteamCMDPathResolution(paths: paths, source: .managedRuntime, legacyPaths: []),
+            client: client
+        )
+
+        try await service.clearLoginSession()
+
+        XCTAssertEqual(client.clearLoginSessionCallCount, 1)
     }
 
     func testSteamCMDXPCRunnerInstallsAndRunsQuitWhenIntegrationEnabled() async throws {
@@ -619,19 +664,19 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let core = SteamCMDRunnerCore(paths: paths, processRunner: runner)
-        let result = try await core.installIfNeeded()
+        let result = try await core.installIfMissing()
 
         XCTAssertEqual(result.runtimeURL, paths.steamCMDDirectory)
         XCTAssertEqual(runner.runCalls.map(\.executableURL), [
             URL(fileURLWithPath: "/bin/sh"),
-            URL(fileURLWithPath: "/bin/bash")
+            paths.steamCMDExecutableURL
         ])
         XCTAssertEqual(runner.runCalls[0].arguments, ["-c", SteamCMDRunnerCore.installShellCommand])
         XCTAssertTrue(SteamCMDRunnerCore.installShellCommand.contains("curl -sqL"))
         XCTAssertTrue(SteamCMDRunnerCore.installShellCommand.contains(SteamCMDRunnerCore.installArchiveURL.absoluteString))
         XCTAssertTrue(SteamCMDRunnerCore.installShellCommand.contains("tar zxvf -"))
-        XCTAssertEqual(runner.runCalls[1].arguments, [paths.executableURL.path, "+quit"])
-        XCTAssertEqual(runner.runCalls[1].environment?["HOME"], paths.steamCMDDirectory.path)
+        XCTAssertEqual(runner.runCalls[1].arguments, ["+quit"])
+        XCTAssertEqual(runner.runCalls[1].environment?["HOME"], paths.steamHomeDirectory.path)
     }
 
     func testSteamCMDRunnerCoreCreatesRuntimeDirectoriesAndRepairsQuarantine() async throws {
@@ -650,7 +695,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let core = SteamCMDRunnerCore(paths: paths, processRunner: runner)
-        _ = try await core.installIfNeeded()
+        _ = try await core.installIfMissing()
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: paths.steamCMDDirectory.appendingPathComponent("tmp", isDirectory: true).path))
         XCTAssertTrue(FileManager.default.fileExists(
@@ -678,9 +723,8 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         let result = try await core.downloadItem(itemID: "3314492008", login: .anonymous, output: { _ in })
 
         let downloadCall = try XCTUnwrap(runner.runCalls.last)
-        XCTAssertEqual(downloadCall.executableURL, URL(fileURLWithPath: "/bin/bash"))
+        XCTAssertEqual(downloadCall.executableURL, paths.steamCMDExecutableURL)
         XCTAssertEqual(downloadCall.arguments, [
-            paths.executableURL.path,
             "+@sSteamCmdForcePlatformType", "windows",
             "+login", "anonymous",
             "+workshop_download_item", "431960", "3314492008",
@@ -713,7 +757,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let service = SteamCMDService(resolution: resolution, processRunner: runner)
-        try await service.installIfNeeded { states.append($0) }
+        try await service.installIfMissing { states.append($0) }
 
         XCTAssertEqual(resolution.source, .managedRuntime)
         XCTAssertNil(resolution.authorizationIssue)
@@ -725,7 +769,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         )
         XCTAssertEqual(runner.runCalls.map(\.executableURL), [
             URL(fileURLWithPath: "/bin/sh"),
-            URL(fileURLWithPath: "/bin/bash")
+            resolution.paths.steamCMDExecutableURL
         ])
         XCTAssertEqual(states, [.checking, .downloading, .extracting, .installed(resolution.paths.executableURL)])
     }
@@ -762,7 +806,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             processRunner: runner,
             securityScopedAccess: securityScope
         )
-        try await service.installIfNeeded()
+        try await service.installIfMissing()
 
         XCTAssertTrue(securityScope.startedURLs.isEmpty)
         XCTAssertTrue(securityScope.stoppedURLs.isEmpty)
@@ -791,26 +835,26 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded()
+        try await service.installIfMissing()
 
         XCTAssertEqual(runner.runCalls.map(\.executableURL), [
             URL(fileURLWithPath: "/bin/sh"),
-            URL(fileURLWithPath: "/bin/bash")
+            paths.steamCMDExecutableURL
         ])
         let installCall = runner.runCalls[0]
         XCTAssertEqual(installCall.currentDirectoryURL, paths.steamCMDDirectory)
-        XCTAssertEqual(installCall.environment?["HOME"], paths.steamCMDDirectory.path)
+        XCTAssertEqual(installCall.environment?["HOME"], paths.steamHomeDirectory.path)
         XCTAssertEqual(installCall.environment?["TMPDIR"], paths.steamCMDDirectory.appendingPathComponent("tmp", isDirectory: true).path)
-        XCTAssertEqual(installCall.environment?["STEAMCMD_HOME"], paths.steamCMDDirectory.path)
+        XCTAssertEqual(installCall.environment?["STEAMCMD_HOME"], paths.steamHomeDirectory.path)
         XCTAssertNotNil(installCall.environment?["PATH"])
 
         let readinessCall = runner.runCalls[1]
-        XCTAssertEqual(readinessCall.executableURL, URL(fileURLWithPath: "/bin/bash"))
-        XCTAssertEqual(readinessCall.arguments, [paths.executableURL.path, "+quit"])
+        XCTAssertEqual(readinessCall.executableURL, paths.steamCMDExecutableURL)
+        XCTAssertEqual(readinessCall.arguments, ["+quit"])
         XCTAssertEqual(readinessCall.currentDirectoryURL, paths.steamCMDDirectory)
-        XCTAssertEqual(readinessCall.environment?["HOME"], paths.steamCMDDirectory.path)
+        XCTAssertEqual(readinessCall.environment?["HOME"], paths.steamHomeDirectory.path)
         XCTAssertEqual(readinessCall.environment?["TMPDIR"], paths.steamCMDDirectory.appendingPathComponent("tmp", isDirectory: true).path)
-        XCTAssertEqual(readinessCall.environment?["STEAMCMD_HOME"], paths.steamCMDDirectory.path)
+        XCTAssertEqual(readinessCall.environment?["STEAMCMD_HOME"], paths.steamHomeDirectory.path)
         XCTAssertTrue(readinessCall.environment?["DYLD_LIBRARY_PATH"]?.hasPrefix(paths.steamCMDDirectory.path) == true)
         XCTAssertTrue(readinessCall.environment?["DYLD_FRAMEWORK_PATH"]?.hasPrefix(paths.steamCMDDirectory.path) == true)
     }
@@ -828,15 +872,15 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         try writeExecutable("binary", to: paths.steamCMDExecutableURL)
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded()
+        try await service.repairRuntime()
 
         XCTAssertEqual(runner.runCalls.map(\.executableURL), [
-            URL(fileURLWithPath: "/bin/bash"),
-            URL(fileURLWithPath: "/bin/bash")
+            paths.steamCMDExecutableURL,
+            paths.steamCMDExecutableURL
         ])
         XCTAssertEqual(runner.runCalls.map(\.arguments), [
-            [paths.executableURL.path, "+quit"],
-            [paths.executableURL.path, "+quit"]
+            ["+quit"],
+            ["+quit"]
         ])
         XCTAssertTrue(runner.runCalls[0].environment?["DYLD_LIBRARY_PATH"]?.hasPrefix(paths.steamCMDDirectory.path) == true)
         XCTAssertTrue(runner.runCalls[0].environment?["DYLD_FRAMEWORK_PATH"]?.hasPrefix(paths.steamCMDDirectory.path) == true)
@@ -857,7 +901,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded()
+        try await service.installIfMissing()
 
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: paths.steamCMDDirectory
@@ -880,15 +924,15 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
                 try self.writeExecutable("#!/usr/bin/env bash\n", to: paths.executableURL)
                 try self.writeExecutable("binary", to: paths.steamCMDExecutableURL)
             }
-            if executableURL == URL(fileURLWithPath: "/bin/bash"),
-               arguments == [paths.executableURL.path, "+quit"] {
+            if executableURL == paths.steamCMDExecutableURL,
+               arguments == ["+quit"] {
                 output("steamcmd: Operation not permitted")
             }
         }
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
         do {
-            try await service.installIfNeeded()
+            try await service.installIfMissing()
             XCTFail("Expected SteamCMD readiness check to fail")
         } catch SteamCMDError.installFailed(let recentOutput) {
             XCTAssertEqual(recentOutput, [
@@ -938,7 +982,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             processRunner: runner,
             securityScopedAccess: securityScope
         )
-        try await service.installIfNeeded()
+        try await service.installIfMissing()
 
         XCTAssertEqual(
             paths.steamCMDDirectory,
@@ -950,37 +994,36 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertTrue(securityScope.stoppedURLs.isEmpty)
         XCTAssertEqual(runner.runCalls.map(\.executableURL), [
             URL(fileURLWithPath: "/bin/sh"),
-            URL(fileURLWithPath: "/bin/bash")
+            paths.steamCMDExecutableURL
         ])
         XCTAssertEqual(runner.runCalls[0].currentDirectoryURL, paths.steamCMDDirectory)
-        XCTAssertEqual(runner.runCalls[1].arguments, [paths.executableURL.path, "+quit"])
+        XCTAssertEqual(runner.runCalls[1].arguments, ["+quit"])
     }
 
-    func testSteamCMDInstallRepairsQuarantinedRuntimeAncestor() async throws {
+    func testSteamCMDRepairRunsReadinessCheckWithoutPatchingLauncher() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = SteamCMDPaths(applicationSupportDirectory: root)
         let runner = FakeProcessRunner()
+        let launcher = """
+        #!/usr/bin/env bash
+        STEAMEXE="${STEAMROOT}/${STEAMCMD}"
+        if [ ! -x "${STEAMEXE}" ]; then
+          STEAMEXE="${STEAMROOT}/Steam.AppBundle/Steam/Contents/MacOS/${STEAMCMD}"
+        fi
+        """
 
-        try FileManager.default.createDirectory(at: paths.steamCMDDirectory.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try setQuarantineAttribute(on: paths.steamCMDDirectory.deletingLastPathComponent())
-
-        runner.onRun = { executableURL, arguments, _, _ in
-            guard executableURL == URL(fileURLWithPath: "/bin/sh"),
-                  arguments == ["-c", SteamCMDService.installShellCommand] else { return }
-            try self.writeExecutable("#!/bin/sh\n", to: paths.executableURL)
-            try self.writeExecutable("binary", to: paths.steamCMDExecutableURL)
-        }
+        try FileManager.default.createDirectory(at: paths.steamCMDDirectory, withIntermediateDirectories: true)
+        try writeExecutable(launcher, to: paths.executableURL)
+        try writeExecutable("binary", to: paths.steamCMDExecutableURL)
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded()
+        try await service.repairRuntime()
 
-        XCTAssertFalse(hasQuarantineAttribute(at: paths.steamCMDDirectory.deletingLastPathComponent()))
-        XCTAssertEqual(runner.runCalls.map(\.executableURL), [
-            URL(fileURLWithPath: "/bin/sh"),
-            URL(fileURLWithPath: "/bin/bash")
-        ])
+        XCTAssertEqual(try String(contentsOf: paths.executableURL), launcher)
+        XCTAssertEqual(runner.runCalls.map(\.executableURL), [paths.steamCMDExecutableURL])
+        XCTAssertEqual(runner.runCalls.map(\.arguments), [["+quit"]])
     }
 
     func testSteamCMDInstallRepairsQuarantinedFreshInstallProducts() async throws {
@@ -999,16 +1042,16 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded()
+        try await service.installIfMissing()
 
         XCTAssertFalse(hasQuarantineAttribute(at: paths.steamCMDExecutableURL))
         XCTAssertEqual(runner.runCalls.map(\.executableURL), [
             URL(fileURLWithPath: "/bin/sh"),
-            URL(fileURLWithPath: "/bin/bash")
+            paths.steamCMDExecutableURL
         ])
     }
 
-    func testSteamCMDInstallQuotesLegacyLauncherExecutableCheckForPathsWithSpaces() async throws {
+    func testSteamCMDInstallDoesNotPatchLegacyLauncherForPathsWithSpaces() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("Application Support", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1031,17 +1074,15 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         try writeExecutable("binary", to: paths.steamCMDExecutableURL)
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded()
+        try await service.installIfMissing()
 
-        let patchedLauncher = try String(contentsOf: paths.executableURL)
-        XCTAssertTrue(patchedLauncher.contains("if [ ! -e \"${STEAMEXE}\" ]; then"))
-        XCTAssertFalse(patchedLauncher.contains("if [ ! -x ${STEAMEXE} ]; then"))
-        XCTAssertFalse(patchedLauncher.contains("if [ ! -x \"${STEAMEXE}\" ]; then"))
+        let installedLauncher = try String(contentsOf: paths.executableURL)
+        XCTAssertEqual(installedLauncher, legacyLauncher)
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: paths.executableURL.path))
-        XCTAssertEqual(runner.runCalls.map(\.arguments), [[paths.executableURL.path, "+quit"]])
+        XCTAssertTrue(runner.runCalls.isEmpty)
     }
 
-    func testSteamCMDInstallPatchesLauncherExecutableCheckToAvoidSandboxFallback() async throws {
+    func testSteamCMDRepairUsesBinaryInsteadOfLauncherScript() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1063,12 +1104,11 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         try writeExecutable("binary", to: paths.steamCMDExecutableURL)
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded()
+        try await service.repairRuntime()
 
-        let patchedLauncher = try String(contentsOf: paths.executableURL)
-        XCTAssertTrue(patchedLauncher.contains("if [ ! -e \"${STEAMEXE}\" ]; then"))
-        XCTAssertFalse(patchedLauncher.contains("if [ ! -x \"${STEAMEXE}\" ]; then"))
-        XCTAssertEqual(runner.runCalls.map(\.arguments), [[paths.executableURL.path, "+quit"]])
+        XCTAssertEqual(try String(contentsOf: paths.executableURL), sandboxSensitiveLauncher)
+        XCTAssertEqual(runner.runCalls.map(\.executableURL), [paths.steamCMDExecutableURL])
+        XCTAssertEqual(runner.runCalls.map(\.arguments), [["+quit"]])
     }
 
     func testSteamCMDInstallUsesPOSIXPermissionsWhenExecutableCheckIsDenied() async throws {
@@ -1084,9 +1124,9 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         try writeExecutable("binary", to: paths.steamCMDExecutableURL)
 
         let service = SteamCMDService(paths: paths, processRunner: runner, fileManager: fileManager)
-        try await service.installIfNeeded()
+        try await service.installIfMissing()
 
-        XCTAssertEqual(runner.runCalls.map(\.arguments), [[paths.executableURL.path, "+quit"]])
+        XCTAssertTrue(runner.runCalls.isEmpty)
         XCTAssertTrue(fileManager.executableCheckPaths.isEmpty)
     }
 
@@ -1124,7 +1164,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded { states.append($0) }
+        try await service.installIfMissing { states.append($0) }
 
         let installCall = try XCTUnwrap(runner.runCalls.first)
         XCTAssertEqual(installCall.executableURL, URL(fileURLWithPath: "/bin/sh"))
@@ -1157,7 +1197,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded()
+        try await service.installIfMissing()
 
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: paths.executableURL.path))
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: paths.steamCMDExecutableURL.path))
@@ -1180,7 +1220,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
         do {
-            try await service.installIfNeeded { states.append($0) }
+            try await service.installIfMissing { states.append($0) }
             XCTFail("Expected SteamCMD install to fail")
         } catch SteamCMDError.installFailed(let recentOutput) {
             XCTAssertEqual(recentOutput, ["Missing steamcmd."])
@@ -1207,7 +1247,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
         do {
-            try await service.installIfNeeded { states.append($0) }
+            try await service.installIfMissing { states.append($0) }
             XCTFail("Expected SteamCMD install to fail")
         } catch let error as SteamCMDError {
             switch error {
@@ -1242,7 +1282,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
         do {
-            try await service.installIfNeeded()
+            try await service.installIfMissing()
             XCTFail("Expected SteamCMD install to fail")
         } catch let error as SteamCMDError {
             switch error {
@@ -1281,16 +1321,16 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
 
         let service = SteamCMDService(paths: paths, processRunner: runner)
-        try await service.installIfNeeded { states.append($0) }
+        try await service.installIfMissing { states.append($0) }
 
         XCTAssertEqual(runner.runCalls.map(\.executableURL), [
             URL(fileURLWithPath: "/bin/sh"),
             URL(fileURLWithPath: "/usr/bin/tar"),
-            URL(fileURLWithPath: "/bin/bash")
+            paths.steamCMDExecutableURL
         ])
         XCTAssertEqual(runner.runCalls[1].arguments, ["zxvf", "steamcmd_osx.tar.gz"])
         XCTAssertEqual(runner.runCalls[1].currentDirectoryURL, paths.steamCMDDirectory)
-        XCTAssertEqual(runner.runCalls[2].arguments, [paths.executableURL.path, "+quit"])
+        XCTAssertEqual(runner.runCalls[2].arguments, ["+quit"])
         XCTAssertEqual(states, [.checking, .downloading, .extracting, .installed(paths.executableURL)])
     }
 
@@ -1313,16 +1353,15 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         )
 
         let downloadCall = try XCTUnwrap(runner.runCalls.last)
-        XCTAssertEqual(downloadCall.executableURL, URL(fileURLWithPath: "/bin/bash"))
+        XCTAssertEqual(downloadCall.executableURL, paths.steamCMDExecutableURL)
         XCTAssertEqual(downloadCall.arguments, [
-            paths.executableURL.path,
             "+@sSteamCmdForcePlatformType", "windows",
             "+login", "anonymous",
             "+workshop_download_item", "431960", "3314492008",
             "+quit"
         ])
         XCTAssertEqual(downloadCall.currentDirectoryURL, paths.steamCMDDirectory)
-        XCTAssertEqual(downloadCall.environment?["HOME"], paths.steamCMDDirectory.path)
+        XCTAssertEqual(downloadCall.environment?["HOME"], paths.steamHomeDirectory.path)
         XCTAssertEqual(downloadCall.environment?["TMPDIR"], paths.steamCMDDirectory.appendingPathComponent("tmp", isDirectory: true).path)
         XCTAssertTrue(downloadCall.environment?["DYLD_LIBRARY_PATH"]?.hasPrefix(paths.steamCMDDirectory.path) == true)
         XCTAssertEqual(downloadedDirectory, paths.workshopContentDirectory.appendingPathComponent("3314492008", isDirectory: true))
@@ -1367,7 +1406,6 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertTrue(securityScope.stoppedURLs.isEmpty)
         XCTAssertNotEqual(paths.steamCMDDirectory, runtimeRoot.appendingPathComponent("SteamCMD", isDirectory: true))
         XCTAssertEqual(runner.runCalls.last?.arguments, [
-            paths.executableURL.path,
             "+@sSteamCmdForcePlatformType", "windows",
             "+login", "anonymous",
             "+workshop_download_item", "431960", "3314492008",
@@ -1387,7 +1425,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         try writeExecutable("#!/usr/bin/env bash\n", to: paths.executableURL)
         try writeExecutable("binary", to: paths.steamCMDExecutableURL)
         runner.onRun = { executableURL, _, output, _ in
-            guard executableURL == URL(fileURLWithPath: "/bin/bash") else { return }
+            guard executableURL == paths.steamCMDExecutableURL else { return }
             guard runner.runCalls.last?.arguments.contains("+workshop_download_item") == true else { return }
             output("steamcmd: operation not permitted")
         }
@@ -1464,6 +1502,54 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         }
     }
 
+    private final class RecordingSteamCMDClient: SteamCMDClient {
+        let paths: SteamCMDPaths
+        private(set) var clearLoginSessionCallCount = 0
+
+        init(paths: SteamCMDPaths) {
+            self.paths = paths
+        }
+
+        func installIfMissing(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
+            progress(.installed(paths.executableURL))
+            return SteamCMDRunnerResult(runtimeURL: paths.steamCMDDirectory, downloadedItemURL: nil, recentOutput: [])
+        }
+
+        func repairRuntime(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
+            progress(.installed(paths.executableURL))
+            return SteamCMDRunnerResult(runtimeURL: paths.steamCMDDirectory, downloadedItemURL: nil, recentOutput: [])
+        }
+
+        func downloadItem(
+            itemID: String,
+            login: SteamCMDLogin,
+            output: @escaping (SteamCMDOutputEvent) -> Void
+        ) async throws -> SteamCMDRunnerResult {
+            SteamCMDRunnerResult(
+                runtimeURL: paths.steamCMDDirectory,
+                downloadedItemURL: paths.workshopContentDirectory.appendingPathComponent(itemID, isDirectory: true),
+                recentOutput: []
+            )
+        }
+
+        func clearLoginSession() async throws {
+            clearLoginSessionCallCount += 1
+        }
+
+        func diagnostics() async -> SteamCMDDiagnostics {
+            SteamCMDDiagnostics(
+                runtimeURL: paths.steamCMDDirectory,
+                source: .managedRuntime,
+                executableURL: paths.executableURL,
+                cwd: paths.steamCMDDirectory,
+                home: paths.steamHomeDirectory,
+                temporaryDirectory: paths.steamCMDDirectory.appendingPathComponent("tmp", isDirectory: true),
+                isUsingXPCClient: false,
+                legacyWorkshopDirectories: []
+            )
+        }
+    }
+
     private func writeExecutable(_ contents: String, to url: URL) throws {
         try Data(contents.utf8).write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
@@ -1512,9 +1598,10 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         )
     }
 
-    func testWorkshopDownloadInputBuildsAccountLoginWithoutPersistingPassword() throws {
+    func testWorkshopDownloadInputBuildsPasswordLoginWithoutPersistingPassword() throws {
         let request = try SteamWorkshopDownloadInput(
             itemInput: "https://steamcommunity.com/sharedfiles/filedetails/?id=3004222851",
+            loginMode: .password,
             username: " alice ",
             password: " secret ",
             steamGuardCode: " 12345 "
@@ -1527,9 +1614,23 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         )
     }
 
-    func testWorkshopDownloadInputFallsBackToAnonymousLogin() throws {
+    func testWorkshopDownloadInputBuildsSavedSessionLoginWithoutPassword() throws {
         let request = try SteamWorkshopDownloadInput(
             itemInput: "3004222851",
+            loginMode: .savedSession,
+            username: " alice ",
+            password: "",
+            steamGuardCode: ""
+        ).makeRequest()
+
+        XCTAssertEqual(request.itemID, "3004222851")
+        XCTAssertEqual(request.login, .savedSession(username: "alice"))
+    }
+
+    func testWorkshopDownloadInputBuildsAnonymousLoginExplicitly() throws {
+        let request = try SteamWorkshopDownloadInput(
+            itemInput: "3004222851",
+            loginMode: .anonymous,
             username: "",
             password: "",
             steamGuardCode: ""

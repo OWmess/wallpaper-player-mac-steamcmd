@@ -352,6 +352,20 @@ enum SteamCMDOutputParser {
     }
 }
 
+struct SteamCMDOutputStreamParser {
+    private var isWaitingForUserInfo = false
+
+    mutating func event(from line: String) -> SteamCMDOutputEvent? {
+        let lowercased = line.lowercased()
+        if isWaitingForUserInfo, lowercased.contains("ok") {
+            isWaitingForUserInfo = false
+            return .loginSucceeded
+        }
+        isWaitingForUserInfo = lowercased.contains("waiting for user info")
+        return SteamCMDOutputParser.event(from: line)
+    }
+}
+
 enum WorkshopLibraryService {
     static func scanDownloadedWallpapers(at root: URL) -> [WEWallpaper] {
         guard let enumerator = FileManager.default.enumerator(
@@ -513,6 +527,7 @@ struct SteamWorkshopAPIService {
 
 enum SteamCMDLogin: Equatable {
     case anonymous
+    case savedSession(username: String)
     case account(username: String, password: String, steamGuardCode: String?)
 }
 
@@ -527,6 +542,8 @@ struct SteamCMDDownloadCommand: Equatable {
         switch login {
         case .anonymous:
             result += ["+login", "anonymous"]
+        case .savedSession(let username):
+            result += ["+login", username]
         case .account(let username, let password, let steamGuardCode):
             result += ["+login", username, password]
             if let steamGuardCode, !steamGuardCode.isEmpty {
@@ -703,27 +720,56 @@ struct SteamCMDPaths: Equatable {
         steamCMDDirectory.appendingPathComponent("steamcmd")
     }
 
-    var workshopContentDirectory: URL {
+    var steamHomeDirectory: URL {
         steamCMDDirectory
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("Steam", isDirectory: true)
+    }
+
+    var workshopContentDirectory: URL {
+        steamHomeDirectory
             .appendingPathComponent("steamapps", isDirectory: true)
             .appendingPathComponent("workshop", isDirectory: true)
             .appendingPathComponent("content", isDirectory: true)
             .appendingPathComponent(SteamCMDDownloadCommand.wallpaperEngineAppID, isDirectory: true)
     }
 
+    var legacyWorkshopContentDirectories: [URL] {
+        [
+            steamCMDDirectory
+                .appendingPathComponent("steamapps", isDirectory: true)
+                .appendingPathComponent("workshop", isDirectory: true)
+                .appendingPathComponent("content", isDirectory: true)
+                .appendingPathComponent(SteamCMDDownloadCommand.wallpaperEngineAppID, isDirectory: true)
+        ]
+    }
+
     func loginSessionCandidateURLs(fileManager: FileManager = .default) -> [URL] {
         var urls = [
+            steamHomeDirectory.appendingPathComponent("config", isDirectory: true),
+            steamHomeDirectory.appendingPathComponent("appcache", isDirectory: true),
+            steamHomeDirectory.appendingPathComponent("userdata", isDirectory: true),
             steamCMDDirectory.appendingPathComponent("config", isDirectory: true),
             steamCMDDirectory.appendingPathComponent("appcache", isDirectory: true)
         ]
-        if let contents = try? fileManager.contentsOfDirectory(
-            at: steamCMDDirectory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) {
-            urls += contents.filter { $0.lastPathComponent.lowercased().hasPrefix("ssfn") }
+        for directory in [steamHomeDirectory, steamCMDDirectory] {
+            if let contents = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) {
+                urls += contents.filter { $0.lastPathComponent.lowercased().hasPrefix("ssfn") }
+            }
         }
-        return urls
+        return uniqueURLs(urls)
+    }
+
+    private func uniqueURLs(_ urls: [URL]) -> [URL] {
+        var seen = Set<String>()
+        return urls.filter { url in
+            seen.insert(url.standardizedFileURL.path).inserted
+        }
     }
 }
 
@@ -799,7 +845,7 @@ struct SteamCMDPathResolution: Equatable {
     var authorizationIssue: SteamCMDRuntimeAuthorizationIssue?
 
     var workshopContentDirectories: [URL] {
-        uniquePaths(([paths] + legacyPaths).map(\.workshopContentDirectory))
+        uniquePaths(([paths] + legacyPaths).flatMap { [$0.workshopContentDirectory] + $0.legacyWorkshopContentDirectories })
     }
 
     func loginSessionCandidateURLs(fileManager: FileManager = .default) -> [URL] {
@@ -1069,12 +1115,14 @@ struct SteamCMDDiagnostics: Equatable {
 protocol SteamCMDClient {
     var paths: SteamCMDPaths { get }
 
-    func installIfNeeded(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult
+    func installIfMissing(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult
+    func repairRuntime(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult
     func downloadItem(
         itemID: String,
         login: SteamCMDLogin,
         output: @escaping (SteamCMDOutputEvent) -> Void
     ) async throws -> SteamCMDRunnerResult
+    func clearLoginSession() async throws
     func diagnostics() async -> SteamCMDDiagnostics
 }
 
@@ -1082,7 +1130,6 @@ struct SteamCMDRunnerCore {
     static let installArchiveURL = URL(string: "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz")!
     static let installShellCommand = "curl -sqL \"\(installArchiveURL.absoluteString)\" | tar zxvf - && chmod 755 steamcmd steamcmd.sh"
     private static let installShellExecutableURL = URL(fileURLWithPath: "/bin/sh")
-    private static let launcherExecutableURL = URL(fileURLWithPath: "/bin/bash")
     private static let tarExecutableURL = URL(fileURLWithPath: "/usr/bin/tar")
     private static let quarantineAttributeName = "com.apple.quarantine"
     private static let steamCMDMagicRestartExitCode: Int32 = 42
@@ -1102,16 +1149,11 @@ struct SteamCMDRunnerCore {
         self.fileManager = fileManager
     }
 
-    func installIfNeeded(progress: @escaping (SteamCMDInstallState) -> Void = { _ in }) async throws -> SteamCMDRunnerResult {
+    func installIfMissing(progress: @escaping (SteamCMDInstallState) -> Void = { _ in }) async throws -> SteamCMDRunnerResult {
         progress(.checking)
         try prepareSteamCMDProcessDirectories()
-        try repairQuarantineForRuntimeAndAncestors()
         try makeInstalledSteamCMDFilesExecutable()
         if isSteamCMDExecutablePairReady {
-            try patchSteamCMDLauncherForPathSpaces()
-            try repairQuarantineForRuntimeAndAncestors()
-            try repairQuarantineUnderRuntime()
-            try await validateInstalledSteamCMD()
             progress(.installed(paths.executableURL))
             return SteamCMDRunnerResult(runtimeURL: paths.steamCMDDirectory, downloadedItemURL: nil, recentOutput: [])
         }
@@ -1121,9 +1163,28 @@ struct SteamCMDRunnerCore {
         return SteamCMDRunnerResult(runtimeURL: paths.steamCMDDirectory, downloadedItemURL: nil, recentOutput: output)
     }
 
+    func repairRuntime(progress: @escaping (SteamCMDInstallState) -> Void = { _ in }) async throws -> SteamCMDRunnerResult {
+        progress(.checking)
+        try prepareSteamCMDProcessDirectories()
+        try makeInstalledSteamCMDFilesExecutable()
+        guard isSteamCMDExecutablePairReady else {
+            let recentOutput = RecentProcessOutput()
+            appendExecutableValidationFailures(to: recentOutput)
+            throw SteamCMDError.installFailed(recentOutput: recentOutput.lines)
+        }
+        let recentOutput = RecentProcessOutput()
+        try repairQuarantineUnderRuntime()
+        try await validateInstalledSteamCMD(recentOutput: recentOutput)
+        progress(.installed(paths.executableURL))
+        return SteamCMDRunnerResult(runtimeURL: paths.steamCMDDirectory, downloadedItemURL: nil, recentOutput: recentOutput.lines)
+    }
+
+    func installIfNeeded(progress: @escaping (SteamCMDInstallState) -> Void = { _ in }) async throws -> SteamCMDRunnerResult {
+        try await installIfMissing(progress: progress)
+    }
+
     private func installFreshSteamCMD(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> [String] {
         try prepareSteamCMDProcessDirectories()
-        try repairQuarantineForRuntimeAndAncestors()
 
         progress(.downloading)
         progress(.extracting)
@@ -1150,8 +1211,6 @@ struct SteamCMDRunnerCore {
                 appendExecutableValidationFailures(to: recentOutput)
             }
             if try await recoverFromLegacyInstallArchiveIfPossible(recentOutput: recentOutput) {
-                try patchSteamCMDLauncherForPathSpaces()
-                try repairQuarantineForRuntimeAndAncestors()
                 try repairQuarantineUnderRuntime()
                 try await validateInstalledSteamCMD(recentOutput: recentOutput)
                 return recentOutput.lines
@@ -1160,8 +1219,6 @@ struct SteamCMDRunnerCore {
             throw SteamCMDError.installFailed(recentOutput: recentOutput.lines)
         }
 
-        try patchSteamCMDLauncherForPathSpaces()
-        try repairQuarantineForRuntimeAndAncestors()
         try repairQuarantineUnderRuntime()
         try await validateInstalledSteamCMD(recentOutput: recentOutput)
         return recentOutput.lines
@@ -1196,10 +1253,7 @@ struct SteamCMDRunnerCore {
     }
 
     private var steamCMDHomeApplicationSupportDirectory: URL {
-        paths.steamCMDDirectory
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("Steam", isDirectory: true)
+        paths.steamHomeDirectory
     }
 
     private func prepareSteamCMDProcessDirectories() throws {
@@ -1214,9 +1268,9 @@ struct SteamCMDRunnerCore {
         if environment["PATH"]?.isEmpty != false {
             environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         }
-        environment["HOME"] = paths.steamCMDDirectory.path
+        environment["HOME"] = paths.steamHomeDirectory.path
         environment["TMPDIR"] = steamCMDTemporaryDirectory.path
-        environment["STEAMCMD_HOME"] = paths.steamCMDDirectory.path
+        environment["STEAMCMD_HOME"] = paths.steamHomeDirectory.path
         environment["DYLD_LIBRARY_PATH"] = prependingSteamCMDDirectory(to: environment["DYLD_LIBRARY_PATH"])
         environment["DYLD_FRAMEWORK_PATH"] = prependingSteamCMDDirectory(to: environment["DYLD_FRAMEWORK_PATH"])
         return environment
@@ -1286,8 +1340,8 @@ struct SteamCMDRunnerCore {
             let status: Int32
             do {
                 status = try await processRunner.run(
-                    executableURL: Self.launcherExecutableURL,
-                    arguments: [paths.executableURL.path] + arguments,
+                    executableURL: paths.steamCMDExecutableURL,
+                    arguments: arguments,
                     currentDirectoryURL: paths.steamCMDDirectory,
                     environment: try steamCMDProcessEnvironment(),
                     output: output
@@ -1304,20 +1358,6 @@ struct SteamCMDRunnerCore {
             return status
         }
         return Self.steamCMDMagicRestartExitCode
-    }
-
-    private func repairQuarantineForRuntimeAndAncestors() throws {
-        for url in runtimeAncestorURLsToCheck() where fileManager.fileExists(atPath: url.path) {
-            if Self.hasQuarantineAttribute(at: url) {
-                do {
-                    try Self.removeQuarantineAttribute(at: url)
-                } catch {
-                    throw SteamCMDError.installFailed(recentOutput: [
-                        "Could not remove quarantine from SteamCMD runtime path \(url.path): \(error.localizedDescription)"
-                    ])
-                }
-            }
-        }
     }
 
     private func validateInstalledSteamCMDIsNotQuarantined() throws {
@@ -1342,19 +1382,6 @@ struct SteamCMDRunnerCore {
             }
         }
         try validateInstalledSteamCMDIsNotQuarantined()
-    }
-
-    private func runtimeAncestorURLsToCheck() -> [URL] {
-        var urls = [URL]()
-        var current = paths.steamCMDDirectory.standardizedFileURL
-        while current.path != "/" {
-            urls.append(current)
-            if current.lastPathComponent == "Application Support" {
-                break
-            }
-            current.deleteLastPathComponent()
-        }
-        return urls
     }
 
     private func quarantinedURLsUnderRuntime() -> [URL] {
@@ -1405,45 +1432,6 @@ struct SteamCMDRunnerCore {
         }
     }
 
-    private func patchSteamCMDLauncherForPathSpaces() throws {
-        guard fileManager.fileExists(atPath: paths.executableURL.path),
-              let launcher = try? String(contentsOf: paths.executableURL, encoding: .utf8) else {
-            return
-        }
-
-        let patchedLauncher = launcher
-            .replacingOccurrences(
-                of: "if [ ! -x ${STEAMEXE} ]; then",
-                with: "if [ ! -e \"${STEAMEXE}\" ]; then"
-            )
-            .replacingOccurrences(
-                of: "if [ ! -x \"${STEAMEXE}\" ]; then",
-                with: "if [ ! -e \"${STEAMEXE}\" ]; then"
-            )
-            .replacingOccurrences(
-                of: "if [ ! -x $STEAMEXE ]; then",
-                with: "if [ ! -e \"$STEAMEXE\" ]; then"
-            )
-            .replacingOccurrences(
-                of: "if [ ! -x \"$STEAMEXE\" ]; then",
-                with: "if [ ! -e \"$STEAMEXE\" ]; then"
-            )
-            .replacingOccurrences(
-                of: "if [ ! -e ${STEAMEXE} ]; then",
-                with: "if [ ! -e \"${STEAMEXE}\" ]; then"
-            )
-            .replacingOccurrences(
-                of: "if [ ! -e $STEAMEXE ]; then",
-                with: "if [ ! -e \"$STEAMEXE\" ]; then"
-            )
-        guard patchedLauncher != launcher else {
-            return
-        }
-
-        try Data(patchedLauncher.utf8).write(to: paths.executableURL)
-        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.executableURL.path)
-    }
-
     private func removePartialExecutablePair() {
         for url in [paths.executableURL, paths.steamCMDExecutableURL] where fileManager.fileExists(atPath: url.path) {
             try? fileManager.removeItem(at: url)
@@ -1455,15 +1443,16 @@ struct SteamCMDRunnerCore {
         login: SteamCMDLogin,
         output: @escaping (SteamCMDOutputEvent) -> Void
     ) async throws -> SteamCMDRunnerResult {
-        _ = try await installIfNeeded()
+        _ = try await installIfMissing()
         let command = SteamCMDDownloadCommand(itemID: itemID, login: login)
         let recentOutput = RecentProcessOutput()
+        var parser = SteamCMDOutputStreamParser()
         let status = try await runSteamCMD(
             arguments: command.arguments,
             recentOutput: recentOutput
         ) { line in
             recentOutput.append(line)
-            if let event = SteamCMDOutputParser.event(from: line) {
+            if let event = parser.event(from: line) {
                 output(event)
             }
         }
@@ -1493,10 +1482,10 @@ struct SteamCMDRunnerCore {
             source: source,
             executableURL: paths.executableURL,
             cwd: paths.steamCMDDirectory,
-            home: paths.steamCMDDirectory,
+            home: paths.steamHomeDirectory,
             temporaryDirectory: steamCMDTemporaryDirectory,
             isUsingXPCClient: isUsingXPCClient,
-            legacyWorkshopDirectories: legacyPaths.map(\.workshopContentDirectory)
+            legacyWorkshopDirectories: legacyPaths.flatMap { [$0.workshopContentDirectory] + $0.legacyWorkshopContentDirectories }
         )
     }
 }
@@ -1504,6 +1493,7 @@ struct SteamCMDRunnerCore {
 @objc(SteamCMDRunnerXPCProtocol)
 protocol SteamCMDRunnerXPCProtocol {
     func install(runtimePath: String, reply: @escaping (NSDictionary) -> Void)
+    func repair(runtimePath: String, reply: @escaping (NSDictionary) -> Void)
     func download(runtimePath: String, itemID: String, login: NSDictionary, reply: @escaping (NSDictionary) -> Void)
     func clearSession(runtimePath: String, legacyRuntimePaths: [String], reply: @escaping (NSDictionary) -> Void)
     func diagnostics(runtimePath: String, source: String, legacyRuntimePaths: [String], reply: @escaping (NSDictionary) -> Void)
@@ -1514,6 +1504,11 @@ enum SteamCMDRunnerXPCPayload {
         switch login {
         case .anonymous:
             return ["kind": "anonymous"]
+        case .savedSession(let username):
+            return [
+                "kind": "savedSession",
+                "username": username
+            ]
         case .account(let username, let password, let steamGuardCode):
             var payload: [String: Any] = [
                 "kind": "account",
@@ -1528,14 +1523,18 @@ enum SteamCMDRunnerXPCPayload {
     }
 
     static func login(from payload: NSDictionary) -> SteamCMDLogin {
-        guard payload["kind"] as? String == "account" else {
+        switch payload["kind"] as? String {
+        case "account":
+            return .account(
+                username: payload["username"] as? String ?? "",
+                password: payload["password"] as? String ?? "",
+                steamGuardCode: payload["steamGuardCode"] as? String
+            )
+        case "savedSession":
+            return .savedSession(username: payload["username"] as? String ?? "")
+        default:
             return .anonymous
         }
-        return .account(
-            username: payload["username"] as? String ?? "",
-            password: payload["password"] as? String ?? "",
-            steamGuardCode: payload["steamGuardCode"] as? String
-        )
     }
 
     static func success(_ result: SteamCMDRunnerResult) -> NSDictionary {
@@ -1642,8 +1641,12 @@ struct LocalSteamCMDClient: SteamCMDClient {
         )
     }
 
-    func installIfNeeded(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
-        try await core.installIfNeeded(progress: progress)
+    func installIfMissing(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
+        try await core.installIfMissing(progress: progress)
+    }
+
+    func repairRuntime(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
+        try await core.repairRuntime(progress: progress)
     }
 
     func downloadItem(
@@ -1661,6 +1664,10 @@ struct LocalSteamCMDClient: SteamCMDClient {
             isUsingXPCClient: false
         )
     }
+
+    func clearLoginSession() async throws {
+        try core.clearLoginSession(legacyPaths: resolution.legacyPaths)
+    }
 }
 
 struct XPCSteamCMDClient: SteamCMDClient {
@@ -1669,12 +1676,19 @@ struct XPCSteamCMDClient: SteamCMDClient {
     var resolution: SteamCMDPathResolution
     var paths: SteamCMDPaths { resolution.paths }
 
-    func installIfNeeded(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
+    func installIfMissing(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
         progress(.checking)
-        progress(.downloading)
-        progress(.extracting)
         let result = try await withRemoteProxy { proxy, reply in
             proxy.install(runtimePath: paths.steamCMDDirectory.path, reply: reply)
+        }
+        progress(.installed(paths.executableURL))
+        return result
+    }
+
+    func repairRuntime(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
+        progress(.checking)
+        let result = try await withRemoteProxy { proxy, reply in
+            proxy.repair(runtimePath: paths.steamCMDDirectory.path, reply: reply)
         }
         progress(.installed(paths.executableURL))
         return result
@@ -1693,8 +1707,19 @@ struct XPCSteamCMDClient: SteamCMDClient {
                 reply: reply
             )
         }
-        result.recentOutput.compactMap(SteamCMDOutputParser.event(from:)).forEach(output)
+        var parser = SteamCMDOutputStreamParser()
+        result.recentOutput.compactMap { parser.event(from: $0) }.forEach(output)
         return result
+    }
+
+    func clearLoginSession() async throws {
+        _ = try await withRemoteProxy { proxy, reply in
+            proxy.clearSession(
+                runtimePath: paths.steamCMDDirectory.path,
+                legacyRuntimePaths: resolution.legacyPaths.map(\.steamCMDDirectory.path),
+                reply: reply
+            )
+        }
     }
 
     func diagnostics() async -> SteamCMDDiagnostics {
@@ -1703,10 +1728,10 @@ struct XPCSteamCMDClient: SteamCMDClient {
             source: resolution.source,
             executableURL: paths.executableURL,
             cwd: paths.steamCMDDirectory,
-            home: paths.steamCMDDirectory,
+            home: paths.steamHomeDirectory,
             temporaryDirectory: paths.steamCMDDirectory.appendingPathComponent("tmp", isDirectory: true),
             isUsingXPCClient: true,
-            legacyWorkshopDirectories: resolution.legacyPaths.map(\.workshopContentDirectory)
+            legacyWorkshopDirectories: resolution.legacyPaths.flatMap { [$0.workshopContentDirectory] + $0.legacyWorkshopContentDirectories }
         )
     }
 
@@ -1805,15 +1830,30 @@ struct SteamCMDService {
         )
     }
 
-    func installIfNeeded(progress: @escaping (SteamCMDInstallState) -> Void = { _ in }) async throws {
+    func installIfMissing(progress: @escaping (SteamCMDInstallState) -> Void = { _ in }) async throws {
         do {
             try await Self.installCoordinator.install(key: paths.steamCMDDirectory.path) {
-                _ = try await client.installIfNeeded(progress: progress)
+                _ = try await client.installIfMissing(progress: progress)
             }
         } catch {
             progress(.failed(error.localizedDescription))
             throw error
         }
+    }
+
+    func repairRuntime(progress: @escaping (SteamCMDInstallState) -> Void = { _ in }) async throws {
+        do {
+            try await Self.installCoordinator.install(key: paths.steamCMDDirectory.path) {
+                _ = try await client.repairRuntime(progress: progress)
+            }
+        } catch {
+            progress(.failed(error.localizedDescription))
+            throw error
+        }
+    }
+
+    func installIfNeeded(progress: @escaping (SteamCMDInstallState) -> Void = { _ in }) async throws {
+        try await installIfMissing(progress: progress)
     }
 
     func downloadItem(
@@ -1825,12 +1865,8 @@ struct SteamCMDService {
         return result.downloadedItemURL ?? paths.workshopContentDirectory.appendingPathComponent(itemID, isDirectory: true)
     }
 
-    func clearLoginSession() throws {
-        for url in resolution.loginSessionCandidateURLs(fileManager: fileManager) {
-            if fileManager.fileExists(atPath: url.path) {
-                try fileManager.removeItem(at: url)
-            }
-        }
+    func clearLoginSession() async throws {
+        try await client.clearLoginSession()
     }
 
     func resetRuntime() throws {
@@ -1954,11 +1990,36 @@ enum SteamWorkshopSupport {
 
 enum SteamWorkshopDownloadInputError: LocalizedError {
     case invalidWorkshopID
+    case missingUsername
+    case missingPassword
 
     var errorDescription: String? {
         switch self {
         case .invalidWorkshopID:
             return "Enter a valid Steam Workshop URL or published file ID."
+        case .missingUsername:
+            return "Enter your Steam username for this login mode."
+        case .missingPassword:
+            return "Enter your Steam password, or switch to Saved Session if you have already logged in."
+        }
+    }
+}
+
+enum SteamWorkshopLoginMode: String, CaseIterable, Identifiable {
+    case anonymous
+    case savedSession
+    case password
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .anonymous:
+            return "Anonymous"
+        case .savedSession:
+            return "Saved Session"
+        case .password:
+            return "Password Login"
         }
     }
 }
@@ -1970,6 +2031,7 @@ struct SteamWorkshopDownloadRequest: Equatable {
 
 struct SteamWorkshopDownloadInput: Equatable {
     var itemInput: String
+    var loginMode: SteamWorkshopLoginMode = .anonymous
     var username: String
     var password: String
     var steamGuardCode: String
@@ -1983,17 +2045,29 @@ struct SteamWorkshopDownloadInput: Equatable {
         let trimmedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedSteamGuardCode = steamGuardCode.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if trimmedUsername.isEmpty || trimmedPassword.isEmpty {
+        switch loginMode {
+        case .anonymous:
             return SteamWorkshopDownloadRequest(itemID: itemID, login: .anonymous)
-        }
-
-        return SteamWorkshopDownloadRequest(
-            itemID: itemID,
-            login: .account(
-                username: trimmedUsername,
-                password: trimmedPassword,
-                steamGuardCode: trimmedSteamGuardCode.isEmpty ? nil : trimmedSteamGuardCode
+        case .savedSession:
+            guard !trimmedUsername.isEmpty else {
+                throw SteamWorkshopDownloadInputError.missingUsername
+            }
+            return SteamWorkshopDownloadRequest(itemID: itemID, login: .savedSession(username: trimmedUsername))
+        case .password:
+            guard !trimmedUsername.isEmpty else {
+                throw SteamWorkshopDownloadInputError.missingUsername
+            }
+            guard !trimmedPassword.isEmpty else {
+                throw SteamWorkshopDownloadInputError.missingPassword
+            }
+            return SteamWorkshopDownloadRequest(
+                itemID: itemID,
+                login: .account(
+                    username: trimmedUsername,
+                    password: trimmedPassword,
+                    steamGuardCode: trimmedSteamGuardCode.isEmpty ? nil : trimmedSteamGuardCode
+                )
             )
-        )
+        }
     }
 }
