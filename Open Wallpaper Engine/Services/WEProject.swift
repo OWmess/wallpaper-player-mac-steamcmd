@@ -207,6 +207,7 @@ struct SteamWorkshopItem: Decodable, Identifiable, Equatable {
     let fileDescription: String?
     let creator: String?
     let previewURL: URL?
+    let timeCreated: Int?
     let tags: [String]
     let previews: [SteamWorkshopPreview]
     let metadata: SteamWorkshopMetadata?
@@ -223,6 +224,7 @@ struct SteamWorkshopItem: Decodable, Identifiable, Equatable {
         case fileDescription = "file_description"
         case creator
         case previewURL = "preview_url"
+        case timeCreated = "time_created"
         case tags
         case previews
         case metadata
@@ -239,6 +241,7 @@ struct SteamWorkshopItem: Decodable, Identifiable, Equatable {
         fileDescription = try container.decodeIfPresent(String.self, forKey: .fileDescription)
         creator = try container.decodeIfPresent(String.self, forKey: .creator)
         previewURL = try container.decodeIfPresent(URL.self, forKey: .previewURL)
+        timeCreated = Self.decodeFlexibleInt(container, forKey: .timeCreated)
         tags = (try container.decodeIfPresent([SteamWorkshopTag].self, forKey: .tags) ?? []).map(\.tag)
         previews = try container.decodeIfPresent([SteamWorkshopPreview].self, forKey: .previews) ?? []
 
@@ -401,13 +404,13 @@ struct SteamWorkshopQuery: Equatable {
         var queryType: Int {
             switch self {
             case .popular:
-                return 12
+                return 9
             case .trending:
                 return 3
             case .latest:
                 return 1
             case .search:
-                return 11
+                return 12
             }
         }
 
@@ -429,14 +432,22 @@ struct SteamWorkshopQuery: Equatable {
     var searchText: String? = nil
     var cursor: String? = nil
     var pageSize: Int = 30
+    var creatorAppID: Int = 431960
+    var requiredTag: String? = nil
+    var matchAllTags: Bool = true
+    var days: Int? = nil
 }
 
 private struct SteamWorkshopQueryRequestPayload: Encodable {
     let appid = 431960
+    let creatorAppID: Int
     let queryType: Int
     let numPerPage: Int
-    let cursor: String?
+    let cursor: String
+    let requiredTag: String?
+    let matchAllTags: Bool
     let searchText: String?
+    let days: Int?
     let returnDetails = true
     let returnMetadata = true
     let returnPreviews = true
@@ -445,10 +456,14 @@ private struct SteamWorkshopQueryRequestPayload: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case appid
+        case creatorAppID = "creator_appid"
         case queryType = "query_type"
         case numPerPage = "numperpage"
         case cursor
+        case requiredTag = "requiredtags"
+        case matchAllTags = "match_all_tags"
         case searchText = "search_text"
+        case days
         case returnDetails = "return_details"
         case returnMetadata = "return_metadata"
         case returnPreviews = "return_previews"

@@ -60,6 +60,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
                 "file_description": "A rainy city wallpaper.",
                 "creator": "76561198000000000",
                 "preview_url": "https://cdn.example/preview.jpg",
+                "time_created": 1700000000,
                 "subscriptions": 42,
                 "favorited": 7,
                 "lifetime_favorited": 9,
@@ -86,6 +87,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(item.id, "3004222851")
         XCTAssertEqual(item.title, "City Rain")
         XCTAssertEqual(item.previewURL, URL(string: "https://cdn.example/preview.jpg"))
+        XCTAssertEqual(item.timeCreated, 1_700_000_000)
         XCTAssertEqual(item.tags, ["Video", "Relaxing"])
         XCTAssertEqual(item.metadata?.type, "video")
         XCTAssertEqual(item.stats.subscriptions, 42)
@@ -177,7 +179,12 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
     func testWorkshopQueryRequestUsesSteamAPIKeyAndInputJSON() throws {
         let request = try SteamWorkshopAPIService.makeQueryRequest(
             apiKey: "steam-api-key",
-            query: SteamWorkshopQuery(sort: .popular, pageSize: 24)
+            query: SteamWorkshopQuery(
+                sort: .popular,
+                cursor: nil,
+                pageSize: 24,
+                requiredTag: "Video"
+            )
         )
         let url = try XCTUnwrap(request.url)
         let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
@@ -191,12 +198,42 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(url.host, "api.steampowered.com")
         XCTAssertEqual(queryItems["key"], "steam-api-key")
         XCTAssertEqual(payload["appid"] as? Int, 431960)
+        XCTAssertEqual(payload["creator_appid"] as? Int, 431960)
         XCTAssertEqual(payload["numperpage"] as? Int, 24)
-        XCTAssertEqual(payload["query_type"] as? Int, SteamWorkshopQuery.Sort.popular.queryType)
+        XCTAssertEqual(payload["cursor"] as? String, "*")
+        XCTAssertEqual(payload["requiredtags"] as? String, "Video")
+        XCTAssertEqual(payload["match_all_tags"] as? Bool, true)
+        XCTAssertEqual(payload["query_type"] as? Int, 9)
         XCTAssertEqual(payload["return_metadata"] as? Bool, true)
         XCTAssertEqual(payload["return_previews"] as? Bool, true)
         XCTAssertEqual(payload["return_tags"] as? Bool, true)
         XCTAssertEqual(payload["return_vote_data"] as? Bool, true)
+    }
+
+    func testWorkshopSortQueryTypesMatchSteamPublishedFileQueryTypeValues() {
+        XCTAssertEqual(SteamWorkshopQuery.Sort.popular.queryType, 9)
+        XCTAssertEqual(SteamWorkshopQuery.Sort.trending.queryType, 3)
+        XCTAssertEqual(SteamWorkshopQuery.Sort.latest.queryType, 1)
+        XCTAssertEqual(SteamWorkshopQuery.Sort.search.queryType, 12)
+    }
+
+    func testWorkshopTrendingRequestIncludesDefaultDays() throws {
+        let request = try SteamWorkshopAPIService.makeQueryRequest(
+            apiKey: "steam-api-key",
+            query: SteamWorkshopQuery(sort: .trending, cursor: "cursor-2", pageSize: 100, requiredTag: "Web")
+        )
+        let inputJSON = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "input_json" })?
+            .value)
+        let payload = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(inputJSON.utf8)) as? [String: Any]
+        )
+
+        XCTAssertEqual(payload["query_type"] as? Int, 3)
+        XCTAssertEqual(payload["cursor"] as? String, "cursor-2")
+        XCTAssertEqual(payload["requiredtags"] as? String, "Web")
+        XCTAssertEqual(payload["days"] as? Int, 7)
     }
 
     func testWorkshopSearchRequestIncludesSearchTextAndQueryType() throws {
@@ -212,7 +249,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             try JSONSerialization.jsonObject(with: Data(inputJSON.utf8)) as? [String: Any]
         )
 
-        XCTAssertEqual(payload["query_type"] as? Int, SteamWorkshopQuery.Sort.search.queryType)
+        XCTAssertEqual(payload["query_type"] as? Int, 12)
         XCTAssertEqual(payload["search_text"] as? String, "city rain")
         XCTAssertEqual(payload["cursor"] as? String, "AoIIPw==")
     }
