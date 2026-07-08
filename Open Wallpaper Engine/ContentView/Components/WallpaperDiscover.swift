@@ -562,25 +562,62 @@ struct SteamWorkshopBrowser: View {
     }
 
     private var workshopList: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
-                ForEach(viewModel.items) { item in
-                    WorkshopItemCard(
-                        item: item,
-                        isSelected: viewModel.selectedItem?.id == item.id,
-                        isDownloading: viewModel.isDownloading,
-                        canDownload: viewModel.canStartDownload
-                    ) {
-                        viewModel.selectedItem = item
-                    } download: {
-                        download(itemID: item.id)
-                    } openInSteam: {
-                        viewModel.openWorkshopPage(for: item)
+        VStack(spacing: 8) {
+            ScrollView {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                    ForEach(viewModel.items) { item in
+                        WorkshopItemCard(
+                            item: item,
+                            isSelected: viewModel.selectedItem?.id == item.id,
+                            isDownloading: viewModel.isDownloading,
+                            canDownload: viewModel.canStartDownload
+                        ) {
+                            viewModel.selectedItem = item
+                        } download: {
+                            download(itemID: item.id)
+                        } openInSteam: {
+                            viewModel.openWorkshopPage(for: item)
+                        }
                     }
                 }
+                .padding(.vertical, 4)
             }
-            .padding(.vertical, 4)
+            workshopPaginationBar
         }
+    }
+
+    private var workshopPaginationBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                viewModel.loadPreviousPage()
+            } label: {
+                Image(systemName: "chevron.left")
+            }
+            .help("Previous page")
+            .disabled(viewModel.isLoading || !viewModel.canLoadPreviousPage)
+
+            Text(viewModel.currentPageNumber > 0 ? "Page \(viewModel.currentPageNumber)" : "Page")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 64)
+
+            Button {
+                Task { await viewModel.loadNextPage() }
+            } label: {
+                Image(systemName: "chevron.right")
+            }
+            .help("Next page")
+            .disabled(viewModel.isLoading || !viewModel.canLoadNextPage)
+
+            if viewModel.isLoading {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            Spacer()
+        }
+        .buttonStyle(.borderless)
+        .padding(.top, 2)
     }
 
     private var workshopDetail: some View {

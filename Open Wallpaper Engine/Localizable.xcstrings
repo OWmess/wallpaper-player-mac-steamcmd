@@ -1177,6 +1177,9 @@
         }
       }
     },
+    "Next page" : {
+
+    },
     "No Tags" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1350,6 +1353,12 @@
         }
       }
     },
+    "Page" : {
+
+    },
+    "Page %lld" : {
+
+    },
     "Paste" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1491,6 +1500,9 @@
           }
         }
       }
+    },
+    "Previous page" : {
+
     },
     "Proceed" : {
       "localizations" : {
