@@ -571,11 +571,16 @@ private struct WorkshopBrowseStream {
     let requiredTag: String
     var nextCursor = "*"
     var isExhausted = false
-    var bufferedItems = [SteamWorkshopItem]()
+    var bufferedItems = [WorkshopBufferedItem]()
 
     var canFetch: Bool {
         !isExhausted
     }
+}
+
+private struct WorkshopBufferedItem {
+    var item: SteamWorkshopItem
+    var arrivalOrder: Int
 }
 
 private struct WorkshopBrowseSession {
@@ -586,6 +591,7 @@ private struct WorkshopBrowseSession {
     ]
     var seenItemIDs = Set<String>()
     var nextInterleavedStreamIndex = 0
+    var nextArrivalOrder = 0
 
     var bufferedItemCount: Int {
         streams.reduce(0) { $0 + $1.bufferedItems.count }
@@ -606,7 +612,10 @@ private struct WorkshopBrowseSession {
     mutating func record(payload: SteamWorkshopQueryPayload, forStreamAt index: Int) {
         let playableItems = payload.items.filter(\.isSupportedByCurrentPlayer)
         for item in playableItems where seenItemIDs.insert(item.id).inserted {
-            streams[index].bufferedItems.append(item)
+            streams[index].bufferedItems.append(
+                WorkshopBufferedItem(item: item, arrivalOrder: nextArrivalOrder)
+            )
+            nextArrivalOrder += 1
         }
 
         guard let responseCursor = payload.nextCursor, !responseCursor.isEmpty, responseCursor != streams[index].nextCursor else {
@@ -627,7 +636,7 @@ private struct WorkshopBrowseSession {
         let selected = streams
             .flatMap(\.bufferedItems)
             .sorted { left, right in
-                switch (left.timeCreated, right.timeCreated) {
+                switch (left.item.timeCreated, right.item.timeCreated) {
                 case let (leftTime?, rightTime?):
                     return leftTime > rightTime
                 case (_?, nil):
@@ -635,15 +644,15 @@ private struct WorkshopBrowseSession {
                 case (nil, _?):
                     return false
                 case (nil, nil):
-                    return left.id < right.id
+                    return left.arrivalOrder < right.arrivalOrder
                 }
             }
             .prefix(limit)
-        let selectedIDs = Set(selected.map(\.id))
+        let selectedIDs = Set(selected.map(\.item.id))
         for index in streams.indices {
-            streams[index].bufferedItems.removeAll { selectedIDs.contains($0.id) }
+            streams[index].bufferedItems.removeAll { selectedIDs.contains($0.item.id) }
         }
-        return Array(selected)
+        return selected.map(\.item)
     }
 
     private mutating func takeInterleavedPageItems(limit: Int) -> [SteamWorkshopItem] {
@@ -655,7 +664,7 @@ private struct WorkshopBrowseSession {
                 guard !streams[index].bufferedItems.isEmpty else {
                     continue
                 }
-                pageItems.append(streams[index].bufferedItems.removeFirst())
+                pageItems.append(streams[index].bufferedItems.removeFirst().item)
                 nextInterleavedStreamIndex = (index + 1) % streams.count
                 didTakeItem = true
                 break
