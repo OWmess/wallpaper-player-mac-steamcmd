@@ -254,6 +254,127 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(payload["cursor"] as? String, "AoIIPw==")
     }
 
+    @MainActor
+    func testWorkshopBrowserRequestsVideoAndWebStreamsAndDeduplicatesResults() async throws {
+        let httpClient = FakeSteamWorkshopHTTPClient(responses: [
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "1001", title: "Video One", type: "video"),
+                    Self.workshopItemJSON(id: "1002", title: "Shared Item", type: "video")
+                ]
+            ),
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "2001", title: "Web One", type: "web"),
+                    Self.workshopItemJSON(id: "1002", title: "Shared Item Duplicate", type: "web")
+                ]
+            )
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = SteamWorkshopBrowserViewModel(
+            apiService: SteamWorkshopAPIService(httpClient: httpClient),
+            steamCMDResolution: SteamCMDPathResolution(
+                paths: SteamCMDPaths(applicationSupportDirectory: root),
+                source: .managedRuntime,
+                legacyPaths: []
+            )
+        )
+        viewModel.apiKey = "steam-api-key"
+
+        await viewModel.browse()
+
+        XCTAssertEqual(viewModel.currentPageNumber, 1)
+        XCTAssertFalse(viewModel.canLoadPreviousPage)
+        XCTAssertFalse(viewModel.canLoadNextPage)
+        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001", "1002"])
+        XCTAssertEqual(httpClient.requiredTags, ["Video", "Web"])
+        XCTAssertEqual(httpClient.cursors, ["*", "*"])
+        XCTAssertEqual(httpClient.pageSizes, [100, 100])
+        XCTAssertEqual(httpClient.matchAllTags, [true, true])
+    }
+
+    @MainActor
+    func testWorkshopBrowserFillsDisplayedPageFromMultipleTypedCursorRounds() async throws {
+        let firstVideoItems = (1...20).map {
+            Self.workshopItemJSON(id: "10\(String(format: "%02d", $0))", title: "Video \($0)", type: "video")
+        }
+        let firstWebItems = (1...10).map {
+            Self.workshopItemJSON(id: "20\(String(format: "%02d", $0))", title: "Web \($0)", type: "web")
+        }
+        let secondVideoItems = (21...45).map {
+            Self.workshopItemJSON(id: "10\(String(format: "%02d", $0))", title: "Video \($0)", type: "video")
+        }
+        let httpClient = FakeSteamWorkshopHTTPClient(responses: [
+            Self.workshopResponseJSON(nextCursor: "video-cursor-2", items: firstVideoItems),
+            Self.workshopResponseJSON(nextCursor: nil, items: firstWebItems),
+            Self.workshopResponseJSON(nextCursor: nil, items: secondVideoItems)
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = SteamWorkshopBrowserViewModel(
+            apiService: SteamWorkshopAPIService(httpClient: httpClient),
+            steamCMDResolution: SteamCMDPathResolution(
+                paths: SteamCMDPaths(applicationSupportDirectory: root),
+                source: .managedRuntime,
+                legacyPaths: []
+            )
+        )
+        viewModel.apiKey = "steam-api-key"
+
+        await viewModel.browse()
+
+        XCTAssertEqual(viewModel.currentPageNumber, 1)
+        XCTAssertEqual(viewModel.items.count, 36)
+        XCTAssertTrue(viewModel.canLoadNextPage)
+        XCTAssertEqual(httpClient.requiredTags, ["Video", "Web", "Video"])
+        XCTAssertEqual(httpClient.cursors, ["*", "*", "video-cursor-2"])
+    }
+
+    @MainActor
+    func testWorkshopBrowserKeepsBrowseQueryStableWhenLoadingNextPage() async throws {
+        let firstVideoItems = (1...36).map {
+            Self.workshopItemJSON(id: "30\(String(format: "%02d", $0))", title: "City Video \($0)", type: "video")
+        }
+        let firstWebItems = (1...36).map {
+            Self.workshopItemJSON(id: "40\(String(format: "%02d", $0))", title: "City Web \($0)", type: "web")
+        }
+        let httpClient = FakeSteamWorkshopHTTPClient(responses: [
+            Self.workshopResponseJSON(nextCursor: nil, items: firstVideoItems),
+            Self.workshopResponseJSON(nextCursor: nil, items: firstWebItems)
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = SteamWorkshopBrowserViewModel(
+            apiService: SteamWorkshopAPIService(httpClient: httpClient),
+            steamCMDResolution: SteamCMDPathResolution(
+                paths: SteamCMDPaths(applicationSupportDirectory: root),
+                source: .managedRuntime,
+                legacyPaths: []
+            )
+        )
+        viewModel.apiKey = "steam-api-key"
+        viewModel.searchText = "city"
+
+        await viewModel.browse()
+        viewModel.searchText = "mountain"
+        viewModel.sort = .latest
+        await viewModel.loadNextPage()
+
+        XCTAssertEqual(viewModel.currentPageNumber, 2)
+        XCTAssertEqual(httpClient.searchTexts, ["city", "city"])
+        XCTAssertEqual(httpClient.queryTypes, [
+            SteamWorkshopQuery.Sort.search.queryType,
+            SteamWorkshopQuery.Sort.search.queryType
+        ])
+        XCTAssertEqual(httpClient.requiredTags, ["Video", "Web"])
+    }
+
     func testSteamCMDDownloadArgumentsForceWindowsAndNeverSubscribe() {
         let command = SteamCMDDownloadCommand(
             itemID: "3004222851",
@@ -1675,6 +1796,154 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
 
         XCTAssertEqual(request.itemID, "3004222851")
         XCTAssertEqual(request.login, .anonymous)
+    }
+
+    func testCachedKeychainCredentialStoreCachesLoadedString() throws {
+        let key = KeychainCredentialKey(service: "service", account: "account")
+        let backend = FakeKeychainCredentialBackend()
+        backend.storage[key] = "secret"
+        let store = CachedKeychainCredentialStore(backend: backend)
+
+        XCTAssertEqual(try store.loadString(for: key), "secret")
+        backend.storage[key] = "changed"
+
+        XCTAssertEqual(try store.loadString(for: key), "secret")
+        XCTAssertEqual(backend.loadCallCount(for: key), 1)
+    }
+
+    func testCachedKeychainCredentialStoreCachesMissingCredential() throws {
+        let key = KeychainCredentialKey(service: "service", account: "missing")
+        let backend = FakeKeychainCredentialBackend()
+        let store = CachedKeychainCredentialStore(backend: backend)
+
+        XCTAssertNil(try store.loadString(for: key))
+        backend.storage[key] = "created-elsewhere"
+
+        XCTAssertNil(try store.loadString(for: key))
+        XCTAssertEqual(backend.loadCallCount(for: key), 1)
+    }
+
+    func testCachedKeychainCredentialStoreUpdatesCacheAfterSaveAndDelete() throws {
+        let key = KeychainCredentialKey(service: "service", account: "mutable")
+        let backend = FakeKeychainCredentialBackend()
+        let store = CachedKeychainCredentialStore(backend: backend)
+
+        try store.saveString("saved", for: key)
+
+        XCTAssertEqual(try store.loadString(for: key), "saved")
+        XCTAssertEqual(backend.storage[key], "saved")
+        XCTAssertEqual(backend.loadCallCount(for: key), 0)
+
+        try store.deleteString(for: key)
+
+        XCTAssertNil(try store.loadString(for: key))
+        XCTAssertNil(backend.storage[key])
+        XCTAssertEqual(backend.loadCallCount(for: key), 0)
+    }
+
+    func testCachedKeychainCredentialStoreDoesNotCacheLoadFailures() throws {
+        let key = KeychainCredentialKey(service: "service", account: "retry")
+        let backend = FakeKeychainCredentialBackend()
+        backend.loadErrors = [FakeKeychainCredentialError.loadFailed]
+        let store = CachedKeychainCredentialStore(backend: backend)
+
+        XCTAssertThrowsError(try store.loadString(for: key))
+        backend.storage[key] = "recovered"
+
+        XCTAssertEqual(try store.loadString(for: key), "recovered")
+        XCTAssertEqual(backend.loadCallCount(for: key), 2)
+    }
+
+    private final class FakeKeychainCredentialBackend: KeychainCredentialBackend {
+        var storage = [KeychainCredentialKey: String]()
+        var loadErrors = [Error]()
+        private var loadCallCounts = [KeychainCredentialKey: Int]()
+
+        func loadString(for key: KeychainCredentialKey) throws -> String? {
+            loadCallCounts[key, default: 0] += 1
+            if !loadErrors.isEmpty {
+                throw loadErrors.removeFirst()
+            }
+            return storage[key]
+        }
+
+        func saveString(_ string: String, for key: KeychainCredentialKey) throws {
+            storage[key] = string
+        }
+
+        func deleteString(for key: KeychainCredentialKey) throws {
+            storage[key] = nil
+        }
+
+        func loadCallCount(for key: KeychainCredentialKey) -> Int {
+            loadCallCounts[key, default: 0]
+        }
+    }
+
+    private enum FakeKeychainCredentialError: Error {
+        case loadFailed
+    }
+
+    private final class FakeSteamWorkshopHTTPClient: SteamWorkshopHTTPClient {
+        private var responses: [Data]
+        private(set) var cursors = [String?]()
+        private(set) var queryTypes = [Int]()
+        private(set) var searchTexts = [String?]()
+        private(set) var requiredTags = [String?]()
+        private(set) var pageSizes = [Int]()
+        private(set) var matchAllTags = [Bool?]()
+
+        init(responses: [Data]) {
+            self.responses = responses
+        }
+
+        func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+            let url = try XCTUnwrap(request.url)
+            let inputJSON = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "input_json" })?
+                .value)
+            let payload = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(inputJSON.utf8)) as? [String: Any]
+            )
+            cursors.append(payload["cursor"] as? String)
+            queryTypes.append(try XCTUnwrap(payload["query_type"] as? Int))
+            searchTexts.append(payload["search_text"] as? String)
+            requiredTags.append(payload["requiredtags"] as? String)
+            pageSizes.append(try XCTUnwrap(payload["numperpage"] as? Int))
+            matchAllTags.append(payload["match_all_tags"] as? Bool)
+            return (
+                responses.removeFirst(),
+                HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            )
+        }
+    }
+
+    private static func workshopResponseJSON(nextCursor: String?, items: [String]) -> Data {
+        """
+        {
+          "response": {
+            "total": \(items.count),
+            \(nextCursor.map { "\"next_cursor\": \"\($0)\"," } ?? "")
+            "publishedfiledetails": [
+              \(items.joined(separator: ","))
+            ]
+          }
+        }
+        """.data(using: .utf8)!
+    }
+
+    private static func workshopItemJSON(id: String, title: String, type: String) -> String {
+        """
+        {
+          "publishedfileid": "\(id)",
+          "title": "\(title)",
+          "metadata": "{\\"type\\":\\"\(type)\\"}",
+          "tags": [
+            { "tag": "\(type)" }
+          ]
+        }
+        """
     }
 
 }

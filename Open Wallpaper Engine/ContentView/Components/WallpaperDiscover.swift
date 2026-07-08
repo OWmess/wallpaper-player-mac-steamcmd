@@ -8,6 +8,136 @@
 import SwiftUI
 import AppKit
 
+private struct WorkshopBrowsePage {
+    var items: [SteamWorkshopItem]
+}
+
+private struct WorkshopBrowseQueryContext {
+    var sort: SteamWorkshopQuery.Sort
+    var searchText: String?
+
+    init(sort: SteamWorkshopQuery.Sort, searchText: String) {
+        let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.sort = trimmedSearch.isEmpty ? sort : .search
+        self.searchText = trimmedSearch.isEmpty ? nil : trimmedSearch
+    }
+}
+
+private struct WorkshopBrowseStream {
+    let requiredTag: String
+    var nextCursor = "*"
+    var isExhausted = false
+    var bufferedItems = [WorkshopBufferedItem]()
+
+    var canFetch: Bool {
+        !isExhausted
+    }
+}
+
+private struct WorkshopBufferedItem {
+    var item: SteamWorkshopItem
+    var arrivalOrder: Int
+}
+
+private struct WorkshopBrowseSession {
+    var queryContext: WorkshopBrowseQueryContext
+    var streams = [
+        WorkshopBrowseStream(requiredTag: "Video"),
+        WorkshopBrowseStream(requiredTag: "Web")
+    ]
+    var seenItemIDs = Set<String>()
+    var nextInterleavedStreamIndex = 0
+    var nextArrivalOrder = 0
+
+    var bufferedItemCount: Int {
+        streams.reduce(0) { $0 + $1.bufferedItems.count }
+    }
+
+    var canFetchMore: Bool {
+        streams.contains { $0.canFetch }
+    }
+
+    var canLoadMore: Bool {
+        bufferedItemCount > 0 || canFetchMore
+    }
+
+    func fetchableStreamIndices() -> [Int] {
+        streams.indices.filter { streams[$0].canFetch }
+    }
+
+    mutating func record(payload: SteamWorkshopQueryPayload, forStreamAt index: Int) {
+        let playableItems = payload.items.filter(\.isSupportedByCurrentPlayer)
+        for item in playableItems where seenItemIDs.insert(item.id).inserted {
+            streams[index].bufferedItems.append(
+                WorkshopBufferedItem(item: item, arrivalOrder: nextArrivalOrder)
+            )
+            nextArrivalOrder += 1
+        }
+
+        guard let responseCursor = payload.nextCursor, !responseCursor.isEmpty, responseCursor != streams[index].nextCursor else {
+            streams[index].isExhausted = true
+            return
+        }
+        streams[index].nextCursor = responseCursor
+    }
+
+    mutating func takePageItems(limit: Int) -> [SteamWorkshopItem] {
+        if queryContext.sort == .latest {
+            return takeLatestPageItems(limit: limit)
+        }
+        return takeInterleavedPageItems(limit: limit)
+    }
+
+    private mutating func takeLatestPageItems(limit: Int) -> [SteamWorkshopItem] {
+        let selected = streams
+            .flatMap(\.bufferedItems)
+            .sorted { left, right in
+                switch (left.item.timeCreated, right.item.timeCreated) {
+                case let (leftTime?, rightTime?):
+                    return leftTime > rightTime
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                case (nil, nil):
+                    return left.arrivalOrder < right.arrivalOrder
+                }
+            }
+            .prefix(limit)
+        let selectedIDs = Set(selected.map(\.item.id))
+        for index in streams.indices {
+            streams[index].bufferedItems.removeAll { selectedIDs.contains($0.item.id) }
+        }
+        return selected.map(\.item)
+    }
+
+    private mutating func takeInterleavedPageItems(limit: Int) -> [SteamWorkshopItem] {
+        var pageItems = [SteamWorkshopItem]()
+        while pageItems.count < limit {
+            var didTakeItem = false
+            for offset in streams.indices {
+                let index = (nextInterleavedStreamIndex + offset) % streams.count
+                guard !streams[index].bufferedItems.isEmpty else {
+                    continue
+                }
+                pageItems.append(streams[index].bufferedItems.removeFirst().item)
+                nextInterleavedStreamIndex = (index + 1) % streams.count
+                didTakeItem = true
+                break
+            }
+            if !didTakeItem {
+                break
+            }
+        }
+        return pageItems
+    }
+}
+
+private struct WorkshopBrowseFetchResult {
+    var page: WorkshopBrowsePage
+    var session: WorkshopBrowseSession
+}
+
 struct WallpaperDiscover: View {
     var body: some View {
         ScrollView {
@@ -20,6 +150,9 @@ struct WallpaperDiscover: View {
 
 @MainActor
 final class SteamWorkshopBrowserViewModel: ObservableObject {
+    private static let displayedPageSize = 36
+    private static let steamBatchSize = 100
+
     @Published var apiKey = ""
     @Published var sort = SteamWorkshopQuery.Sort.popular
     @Published var searchText = ""
@@ -35,9 +168,13 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
     @Published var isDownloading = false
     @Published var installState = SteamCMDInstallState.idle
     @Published private(set) var steamCMDResolution: SteamCMDPathResolution
+    @Published private(set) var currentPageNumber = 0
 
     private let apiService: SteamWorkshopAPIService
     private var steamCMDService: SteamCMDService
+    private var pages = [WorkshopBrowsePage]()
+    private var currentPageIndex = -1
+    private var activeSession: WorkshopBrowseSession?
 
     init(
         apiService: SteamWorkshopAPIService = SteamWorkshopAPIService(),
@@ -66,6 +203,15 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
 
     var canStartDownload: Bool {
         installState.isInstalled && !isDownloading
+    }
+
+    var canLoadPreviousPage: Bool {
+        currentPageIndex > 0
+    }
+
+    var canLoadNextPage: Bool {
+        guard currentPageIndex >= 0 else { return false }
+        return currentPageIndex + 1 < pages.count || activeSession?.canLoadMore == true
     }
 
     func loadAPIKey() {
@@ -145,24 +291,101 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-            let effectiveSort: SteamWorkshopQuery.Sort = trimmedSearch.isEmpty ? sort : .search
-            let payload = try await apiService.queryFiles(
+            let queryContext = WorkshopBrowseQueryContext(sort: sort, searchText: searchText)
+            let result = try await fetchPage(
                 apiKey: trimmedKey,
-                query: SteamWorkshopQuery(
-                    sort: effectiveSort,
-                    searchText: trimmedSearch.isEmpty ? nil : trimmedSearch,
-                    pageSize: 36
-                )
+                session: WorkshopBrowseSession(queryContext: queryContext)
             )
-            items = payload.items.filter(\.isSupportedByCurrentPlayer)
-            selectedItem = items.first
-            statusMessage = items.isEmpty
-                ? "No playable Video/Web Workshop items found."
-                : "Loaded \(items.count) playable Workshop items."
+            activeSession = result.session
+            pages = [result.page]
+            showPage(at: 0)
+            updateStatusForCurrentPage()
         } catch {
             statusMessage = error.localizedDescription
         }
+    }
+
+    func loadNextPage() async {
+        guard canLoadNextPage else { return }
+
+        if currentPageIndex + 1 < pages.count {
+            showPage(at: currentPageIndex + 1)
+            updateStatusForCurrentPage()
+            return
+        }
+
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty, let session = activeSession else {
+            return
+        }
+
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            let result = try await fetchPage(apiKey: trimmedKey, session: session)
+            activeSession = result.session
+            pages.append(result.page)
+            showPage(at: pages.count - 1)
+            updateStatusForCurrentPage()
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func loadPreviousPage() {
+        guard canLoadPreviousPage else { return }
+        showPage(at: currentPageIndex - 1)
+        updateStatusForCurrentPage()
+    }
+
+    private func updateStatusForCurrentPage() {
+        statusMessage = items.isEmpty
+            ? "No playable Video/Web Workshop items found on page \(currentPageNumber)."
+            : "Loaded page \(currentPageNumber) with \(items.count) playable Workshop items."
+    }
+
+    private func fetchPage(
+        apiKey: String,
+        session: WorkshopBrowseSession
+    ) async throws -> WorkshopBrowseFetchResult {
+        var session = session
+
+        while session.bufferedItemCount < Self.displayedPageSize, session.canFetchMore {
+            let fetchableIndices = session.fetchableStreamIndices()
+            guard !fetchableIndices.isEmpty else {
+                break
+            }
+
+            for index in fetchableIndices {
+                let stream = session.streams[index]
+                let payload = try await apiService.queryFiles(
+                    apiKey: apiKey,
+                    query: SteamWorkshopQuery(
+                        sort: session.queryContext.sort,
+                        searchText: session.queryContext.searchText,
+                        cursor: stream.nextCursor,
+                        pageSize: Self.steamBatchSize,
+                        requiredTag: stream.requiredTag
+                    )
+                )
+                session.record(payload: payload, forStreamAt: index)
+            }
+        }
+
+        let pageItems = session.takePageItems(limit: Self.displayedPageSize)
+        return WorkshopBrowseFetchResult(
+            page: WorkshopBrowsePage(items: pageItems),
+            session: session
+        )
+    }
+
+    private func showPage(at index: Int) {
+        guard pages.indices.contains(index) else { return }
+        currentPageIndex = index
+        currentPageNumber = index + 1
+        items = pages[index].items
+        selectedItem = items.first
     }
 
     @discardableResult
