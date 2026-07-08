@@ -32,48 +32,9 @@ struct ContentView: View {
     
     var body: some View {
         ZStack {
-            HSplitView {
-                if viewModel.isStaging {
-                    VStack(spacing: 5) {
-                        TopTabBar(contentViewModel: viewModel)
-                        switch viewModel.topTabBarSelection {
-                        case 0:
-                            ExplorerTopBar(contentViewModel: viewModel)
-                                .environmentObject(globalSettingsViewModel)
-                            HStack(spacing: 0) {
-                                HStack(spacing: 0) {
-                                    // MARK: Filter Results
-                                    FilterResults(viewModel: viewModel)
-                                }
-                                .frame(width: viewModel.isFilterReveal ? 225 : 0)
-                                .opacity(viewModel.isFilterReveal ? 1 : 0)
-                                .animation(.spring(), value: viewModel.isFilterReveal)
-                                
-                                WallpaperExplorer(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
-                                .onDrop(of: [.fileURL], delegate: viewModel)
-                                .contextMenu {
-                                    ExplorerGlobalMenu(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
-                                }
-                                .padding(.leading, viewModel.isFilterReveal ? 10 : 0)
-                            }
-                            .animation(.default, value: viewModel.isFilterReveal)
-                        case 1:
-                            WallpaperDiscover()
-                        case 2:
-                            SteamWorkshopBrowser(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        default:
-                            fatalError()
-                        }
-                        ExplorerBottomBar()
-                    }
-                    .padding()
-                    WallpaperPreview(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
-                        .frame(maxWidth: 320)
-                }
+            if viewModel.isStaging {
+                stagedContent
             }
-            .opacity(viewModel.isStaging ? 1 : 0)
-            .blur(radius: viewModel.isStaging ? 0 : 2.0)
             
             // indicate that this view is initializing
             if !viewModel.isStaging {
@@ -124,6 +85,62 @@ struct ContentView: View {
                 .frame(width: 600, height: 300)
         }
         .frame(minWidth: 1000, minHeight: 640, idealHeight: 800)
+    }
+
+    @ViewBuilder
+    private var stagedContent: some View {
+        if viewModel.topTabBarSelection == 2 {
+            contentColumn
+                .padding()
+        } else {
+            HSplitView {
+                contentColumn
+                    .padding()
+                WallpaperPreview(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
+                    .frame(maxWidth: 320)
+            }
+        }
+    }
+
+    private var contentColumn: some View {
+        VStack(spacing: 5) {
+            TopTabBar(contentViewModel: viewModel)
+            selectedTabContent
+            ExplorerBottomBar()
+        }
+    }
+
+    @ViewBuilder
+    private var selectedTabContent: some View {
+        switch viewModel.topTabBarSelection {
+        case 0:
+            ExplorerTopBar(contentViewModel: viewModel)
+                .environmentObject(globalSettingsViewModel)
+            HStack(spacing: 0) {
+                HStack(spacing: 0) {
+                    // MARK: Filter Results
+                    FilterResults(viewModel: viewModel)
+                }
+                .frame(width: viewModel.isFilterReveal ? 225 : 0)
+                .opacity(viewModel.isFilterReveal ? 1 : 0)
+                .animation(.spring(), value: viewModel.isFilterReveal)
+
+                WallpaperExplorer(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
+                    .onDrop(of: [.fileURL], delegate: viewModel)
+                    .contextMenu {
+                        ExplorerGlobalMenu(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
+                    }
+                    .padding(.leading, viewModel.isFilterReveal ? 10 : 0)
+            }
+            .animation(.default, value: viewModel.isFilterReveal)
+        case 1:
+            WallpaperDiscover()
+        case 2:
+            SteamWorkshopBrowser(contentViewModel: viewModel, wallpaperViewModel: wallpaperViewModel)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        default:
+            fatalError()
+        }
     }
 }
 

@@ -10,9 +10,10 @@ import AppKit
 
 private struct WorkshopBrowsePage {
     var items: [SteamWorkshopItem]
+    var nextCursor: String?
 }
 
-private struct WorkshopBrowseQueryContext {
+private struct WorkshopBrowseQueryContext: Equatable {
     var sort: SteamWorkshopQuery.Sort
     var searchText: String?
 
@@ -23,127 +24,61 @@ private struct WorkshopBrowseQueryContext {
     }
 }
 
-private struct WorkshopBrowseStream {
-    let requiredTag: String
+private struct WorkshopPageState {
+    var queryContext: WorkshopBrowseQueryContext
+    var pages = [WorkshopBrowsePage]()
+    var currentPageIndex = -1
     var nextCursor = "*"
     var isExhausted = false
-    var bufferedItems = [WorkshopBufferedItem]()
 
-    var canFetch: Bool {
-        !isExhausted
-    }
-}
-
-private struct WorkshopBufferedItem {
-    var item: SteamWorkshopItem
-    var arrivalOrder: Int
-}
-
-private struct WorkshopBrowseSession {
-    var queryContext: WorkshopBrowseQueryContext
-    var streams = [
-        WorkshopBrowseStream(requiredTag: "Video"),
-        WorkshopBrowseStream(requiredTag: "Web")
-    ]
-    var seenItemIDs = Set<String>()
-    var nextInterleavedStreamIndex = 0
-    var nextArrivalOrder = 0
-
-    var bufferedItemCount: Int {
-        streams.reduce(0) { $0 + $1.bufferedItems.count }
+    var canLoadPreviousPage: Bool {
+        currentPageIndex > 0
     }
 
-    var canFetchMore: Bool {
-        streams.contains { $0.canFetch }
+    var canLoadNextPage: Bool {
+        guard currentPageIndex >= 0 else { return false }
+        return currentPageIndex + 1 < pages.count || !isExhausted
     }
 
-    var canLoadMore: Bool {
-        bufferedItemCount > 0 || canFetchMore
+    var currentPage: WorkshopBrowsePage? {
+        guard pages.indices.contains(currentPageIndex) else { return nil }
+        return pages[currentPageIndex]
     }
 
-    func fetchableStreamIndices() -> [Int] {
-        streams.indices.filter { streams[$0].canFetch }
+    mutating func reset(with page: WorkshopBrowsePage) {
+        pages = [page]
+        currentPageIndex = 0
+        updateCursor(from: page)
     }
 
-    mutating func record(payload: SteamWorkshopQueryPayload, forStreamAt index: Int) {
-        let playableItems = payload.items.filter(\.isSupportedByCurrentPlayer)
-        for item in playableItems where seenItemIDs.insert(item.id).inserted {
-            streams[index].bufferedItems.append(
-                WorkshopBufferedItem(item: item, arrivalOrder: nextArrivalOrder)
-            )
-            nextArrivalOrder += 1
-        }
+    mutating func append(_ page: WorkshopBrowsePage) {
+        pages.append(page)
+        currentPageIndex = pages.count - 1
+        updateCursor(from: page)
+    }
 
-        guard let responseCursor = payload.nextCursor, !responseCursor.isEmpty, responseCursor != streams[index].nextCursor else {
-            streams[index].isExhausted = true
+    mutating func moveToPreviousPage() {
+        guard canLoadPreviousPage else { return }
+        currentPageIndex -= 1
+    }
+
+    mutating func moveToNextCachedPage() {
+        guard currentPageIndex + 1 < pages.count else { return }
+        currentPageIndex += 1
+    }
+
+    private mutating func updateCursor(from page: WorkshopBrowsePage) {
+        guard let cursor = page.nextCursor, !cursor.isEmpty, cursor != nextCursor else {
+            isExhausted = true
             return
         }
-        streams[index].nextCursor = responseCursor
-    }
-
-    mutating func takePageItems(limit: Int) -> [SteamWorkshopItem] {
-        if queryContext.sort == .latest {
-            return takeLatestPageItems(limit: limit)
-        }
-        return takeInterleavedPageItems(limit: limit)
-    }
-
-    private mutating func takeLatestPageItems(limit: Int) -> [SteamWorkshopItem] {
-        let bufferedItems = streams
-            .flatMap(\.bufferedItems)
-            .sorted { $0.arrivalOrder < $1.arrivalOrder }
-        let sortedTimedItems = bufferedItems
-            .filter { $0.item.timeCreated != nil }
-            .sorted { left, right in
-                let leftTime = left.item.timeCreated ?? 0
-                let rightTime = right.item.timeCreated ?? 0
-                if leftTime != rightTime {
-                    return leftTime > rightTime
-                }
-                return left.arrivalOrder < right.arrivalOrder
-            }
-        var timedIndex = 0
-        let orderedItems = bufferedItems.map { bufferedItem in
-            guard bufferedItem.item.timeCreated != nil else {
-                return bufferedItem
-            }
-            defer { timedIndex += 1 }
-            return sortedTimedItems[timedIndex]
-        }
-        let selected = orderedItems
-            .prefix(limit)
-        let selectedIDs = Set(selected.map(\.item.id))
-        for index in streams.indices {
-            streams[index].bufferedItems.removeAll { selectedIDs.contains($0.item.id) }
-        }
-        return selected.map(\.item)
-    }
-
-    private mutating func takeInterleavedPageItems(limit: Int) -> [SteamWorkshopItem] {
-        var pageItems = [SteamWorkshopItem]()
-        while pageItems.count < limit {
-            var didTakeItem = false
-            for offset in streams.indices {
-                let index = (nextInterleavedStreamIndex + offset) % streams.count
-                guard !streams[index].bufferedItems.isEmpty else {
-                    continue
-                }
-                pageItems.append(streams[index].bufferedItems.removeFirst().item)
-                nextInterleavedStreamIndex = (index + 1) % streams.count
-                didTakeItem = true
-                break
-            }
-            if !didTakeItem {
-                break
-            }
-        }
-        return pageItems
+        nextCursor = cursor
+        isExhausted = false
     }
 }
 
 private struct WorkshopBrowseFetchResult {
     var page: WorkshopBrowsePage
-    var session: WorkshopBrowseSession
 }
 
 struct WallpaperDiscover: View {
@@ -158,8 +93,8 @@ struct WallpaperDiscover: View {
 
 @MainActor
 final class SteamWorkshopBrowserViewModel: ObservableObject {
-    private static let displayedPageSize = 36
-    private static let steamBatchSize = 100
+    private static let displayedPageSize = 24
+    private static let videoWebTags = "Video,Web"
 
     @Published var apiKey = ""
     @Published var sort = SteamWorkshopQuery.Sort.popular
@@ -180,9 +115,7 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
 
     private let apiService: SteamWorkshopAPIService
     private var steamCMDService: SteamCMDService
-    private var pages = [WorkshopBrowsePage]()
-    private var currentPageIndex = -1
-    private var activeSession: WorkshopBrowseSession?
+    private var pageState: WorkshopPageState?
 
     init(
         apiService: SteamWorkshopAPIService = SteamWorkshopAPIService(),
@@ -214,12 +147,11 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
     }
 
     var canLoadPreviousPage: Bool {
-        currentPageIndex > 0
+        pageState?.canLoadPreviousPage == true
     }
 
     var canLoadNextPage: Bool {
-        guard currentPageIndex >= 0 else { return false }
-        return currentPageIndex + 1 < pages.count || activeSession?.canLoadMore == true
+        pageState?.canLoadNextPage == true
     }
 
     func loadAPIKey() {
@@ -302,13 +234,19 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
             let queryContext = WorkshopBrowseQueryContext(sort: sort, searchText: searchText)
             let result = try await fetchPage(
                 apiKey: trimmedKey,
-                session: WorkshopBrowseSession(queryContext: queryContext)
+                queryContext: queryContext,
+                cursor: "*"
             )
-            activeSession = result.session
-            pages = [result.page]
-            showPage(at: 0)
+            var state = WorkshopPageState(queryContext: queryContext)
+            state.reset(with: result.page)
+            pageState = state
+            showCurrentPage()
             updateStatusForCurrentPage()
         } catch {
+            pageState = nil
+            items = []
+            selectedItem = nil
+            currentPageNumber = 0
             statusMessage = error.localizedDescription
         }
     }
@@ -316,14 +254,18 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
     func loadNextPage() async {
         guard canLoadNextPage else { return }
 
-        if currentPageIndex + 1 < pages.count {
-            showPage(at: currentPageIndex + 1)
+        guard var state = pageState else { return }
+
+        if state.currentPageIndex + 1 < state.pages.count {
+            state.moveToNextCachedPage()
+            pageState = state
+            showCurrentPage()
             updateStatusForCurrentPage()
             return
         }
 
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedKey.isEmpty, let session = activeSession else {
+        guard !trimmedKey.isEmpty, !state.isExhausted else {
             return
         }
 
@@ -331,10 +273,14 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let result = try await fetchPage(apiKey: trimmedKey, session: session)
-            activeSession = result.session
-            pages.append(result.page)
-            showPage(at: pages.count - 1)
+            let result = try await fetchPage(
+                apiKey: trimmedKey,
+                queryContext: state.queryContext,
+                cursor: state.nextCursor
+            )
+            state.append(result.page)
+            pageState = state
+            showCurrentPage()
             updateStatusForCurrentPage()
         } catch {
             statusMessage = error.localizedDescription
@@ -342,57 +288,53 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
     }
 
     func loadPreviousPage() {
-        guard canLoadPreviousPage else { return }
-        showPage(at: currentPageIndex - 1)
+        guard var state = pageState, state.canLoadPreviousPage else { return }
+        state.moveToPreviousPage()
+        pageState = state
+        showCurrentPage()
         updateStatusForCurrentPage()
     }
 
     private func updateStatusForCurrentPage() {
-        statusMessage = items.isEmpty
-            ? "No playable Video/Web Workshop items found on page \(currentPageNumber)."
-            : "Loaded page \(currentPageNumber) with \(items.count) playable Workshop items."
+        if items.isEmpty {
+            if currentPageNumber == 1, pageState?.queryContext.searchText == nil {
+                statusMessage = "Steam did not return Video/Web Workshop results for the combined tag query."
+            } else {
+                statusMessage = "No playable Video/Web Workshop items found on page \(currentPageNumber)."
+            }
+        } else {
+            statusMessage = "Loaded page \(currentPageNumber) with \(items.count) playable Workshop items."
+        }
     }
 
     private func fetchPage(
         apiKey: String,
-        session: WorkshopBrowseSession
+        queryContext: WorkshopBrowseQueryContext,
+        cursor: String
     ) async throws -> WorkshopBrowseFetchResult {
-        var session = session
-
-        while session.bufferedItemCount < Self.displayedPageSize, session.canFetchMore {
-            let fetchableIndices = session.fetchableStreamIndices()
-            guard !fetchableIndices.isEmpty else {
-                break
-            }
-
-            for index in fetchableIndices {
-                let stream = session.streams[index]
-                let payload = try await apiService.queryFiles(
-                    apiKey: apiKey,
-                    query: SteamWorkshopQuery(
-                        sort: session.queryContext.sort,
-                        searchText: session.queryContext.searchText,
-                        cursor: stream.nextCursor,
-                        pageSize: Self.steamBatchSize,
-                        requiredTag: stream.requiredTag
-                    )
-                )
-                session.record(payload: payload, forStreamAt: index)
-            }
-        }
-
-        let pageItems = session.takePageItems(limit: Self.displayedPageSize)
+        let payload = try await apiService.queryFiles(
+            apiKey: apiKey,
+            query: SteamWorkshopQuery(
+                sort: queryContext.sort,
+                searchText: queryContext.searchText,
+                cursor: cursor,
+                pageSize: Self.displayedPageSize,
+                requiredTag: Self.videoWebTags,
+                matchAllTags: false
+            )
+        )
+        let pageItems = payload.items
+            .filter(\.isSupportedByCurrentPlayer)
+            .prefix(Self.displayedPageSize)
         return WorkshopBrowseFetchResult(
-            page: WorkshopBrowsePage(items: pageItems),
-            session: session
+            page: WorkshopBrowsePage(items: Array(pageItems), nextCursor: payload.nextCursor)
         )
     }
 
-    private func showPage(at index: Int) {
-        guard pages.indices.contains(index) else { return }
-        currentPageIndex = index
-        currentPageNumber = index + 1
-        items = pages[index].items
+    private func showCurrentPage() {
+        guard let state = pageState, let page = state.currentPage else { return }
+        currentPageNumber = state.currentPageIndex + 1
+        items = page.items
         selectedItem = items.first
     }
 
@@ -536,7 +478,6 @@ struct SteamWorkshopBrowser: View {
         .onAppear {
             viewModel.refreshSteamCMDResolution()
             viewModel.loadAPIKey()
-            Task { await viewModel.ensureSteamCMDInstalled() }
             if viewModel.apiKey.isEmpty {
                 viewModel.statusMessage = "Paste a Steam Web API key to browse here, or use a Workshop URL/ID to download directly."
             } else if viewModel.items.isEmpty {
@@ -576,15 +517,9 @@ struct SteamWorkshopBrowser: View {
                     ForEach(viewModel.items) { item in
                         WorkshopItemCard(
                             item: item,
-                            isSelected: viewModel.selectedItem?.id == item.id,
-                            isDownloading: viewModel.isDownloading,
-                            canDownload: viewModel.canStartDownload
+                            isSelected: viewModel.selectedItem?.id == item.id
                         ) {
                             viewModel.selectedItem = item
-                        } download: {
-                            download(itemID: item.id)
-                        } openInSteam: {
-                            viewModel.openWorkshopPage(for: item)
                         }
                     }
                 }
@@ -882,69 +817,58 @@ struct SteamWorkshopBrowser: View {
 private struct WorkshopItemCard: View {
     let item: SteamWorkshopItem
     let isSelected: Bool
-    let isDownloading: Bool
-    let canDownload: Bool
     let select: () -> Void
-    let download: () -> Void
-    let openInSteam: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            AsyncImage(url: item.previewURL) { image in
-                image
-                    .resizable()
-                    .scaledToFill()
-            } placeholder: {
-                Image("we.placeholder")
-                    .resizable()
-                    .scaledToFit()
-                    .padding(24)
-            }
-            .frame(height: 112)
-            .frame(maxWidth: .infinity)
-            .clipped()
-            .background(Color.secondary.opacity(0.12))
-
-            Text(item.title)
-                .font(.headline)
-                .lineLimit(2)
-                .frame(minHeight: 48, alignment: .topLeading)
-
-            Text(item.tags.prefix(3).joined(separator: " / "))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            HStack {
-                Button(action: download) {
-                    Image(systemName: "arrow.down")
+        Button(action: select) {
+            VStack(alignment: .leading, spacing: 8) {
+                AsyncImage(url: item.previewURL) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    Image("we.placeholder")
+                        .resizable()
+                        .scaledToFit()
+                        .padding(24)
                 }
-                .help("Download")
-                .disabled(isDownloading || !canDownload)
+                .frame(height: 112)
+                .frame(maxWidth: .infinity)
+                .clipped()
+                .background(Color.secondary.opacity(0.12))
 
-                Button(action: openInSteam) {
-                    Image(systemName: "safari")
-                }
-                .help("Open in Steam")
+                Text(item.title)
+                    .font(.headline)
+                    .lineLimit(2)
+                    .frame(minHeight: 48, alignment: .topLeading)
 
-                Spacer()
-                Text(scoreText)
-                    .font(.caption2)
+                Text(item.tags.prefix(3).joined(separator: " / "))
+                    .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                HStack {
+                    Text(scoreText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
-            .buttonStyle(.borderless)
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(NSColor.controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.2), lineWidth: isSelected ? 2 : 1)
+            )
+            .contentShape(Rectangle())
         }
-        .padding(8)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color(NSColor.controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.2), lineWidth: isSelected ? 2 : 1)
-        )
-        .contentShape(Rectangle())
-        .onTapGesture(perform: select)
+        .buttonStyle(.plain)
     }
 
     private var scoreText: String {

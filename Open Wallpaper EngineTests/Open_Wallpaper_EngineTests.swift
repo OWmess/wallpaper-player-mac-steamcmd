@@ -183,7 +183,8 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
                 sort: .popular,
                 cursor: nil,
                 pageSize: 24,
-                requiredTag: "Video"
+                requiredTag: "Video,Web",
+                matchAllTags: false
             )
         )
         let url = try XCTUnwrap(request.url)
@@ -201,8 +202,8 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(payload["creator_appid"] as? Int, 431960)
         XCTAssertEqual(payload["numperpage"] as? Int, 24)
         XCTAssertEqual(payload["cursor"] as? String, "*")
-        XCTAssertEqual(payload["requiredtags"] as? String, "Video")
-        XCTAssertEqual(payload["match_all_tags"] as? Bool, true)
+        XCTAssertEqual(payload["requiredtags"] as? String, "Video,Web")
+        XCTAssertEqual(payload["match_all_tags"] as? Bool, false)
         XCTAssertEqual(payload["query_type"] as? Int, 9)
         XCTAssertEqual(payload["return_metadata"] as? Bool, true)
         XCTAssertEqual(payload["return_previews"] as? Bool, true)
@@ -255,20 +256,14 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
     }
 
     @MainActor
-    func testWorkshopBrowserRequestsVideoAndWebStreamsAndDeduplicatesResults() async throws {
+    func testWorkshopBrowserRequestsSingleVideoWebORPage() async throws {
         let httpClient = FakeSteamWorkshopHTTPClient(responses: [
             Self.workshopResponseJSON(
                 nextCursor: nil,
                 items: [
                     Self.workshopItemJSON(id: "1001", title: "Video One", type: "video"),
-                    Self.workshopItemJSON(id: "1002", title: "Shared Item", type: "video")
-                ]
-            ),
-            Self.workshopResponseJSON(
-                nextCursor: nil,
-                items: [
                     Self.workshopItemJSON(id: "2001", title: "Web One", type: "web"),
-                    Self.workshopItemJSON(id: "1002", title: "Shared Item Duplicate", type: "web")
+                    Self.workshopItemJSON(id: "3001", title: "Scene One", type: "scene")
                 ]
             )
         ])
@@ -290,28 +285,25 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(viewModel.currentPageNumber, 1)
         XCTAssertFalse(viewModel.canLoadPreviousPage)
         XCTAssertFalse(viewModel.canLoadNextPage)
-        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001", "1002"])
-        XCTAssertEqual(httpClient.requiredTags, ["Video", "Web"])
-        XCTAssertEqual(httpClient.cursors, ["*", "*"])
-        XCTAssertEqual(httpClient.pageSizes, [100, 100])
-        XCTAssertEqual(httpClient.matchAllTags, [true, true])
+        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001"])
+        XCTAssertEqual(httpClient.requiredTags, ["Video,Web"])
+        XCTAssertEqual(httpClient.cursors, ["*"])
+        XCTAssertEqual(httpClient.pageSizes, [24])
+        XCTAssertEqual(httpClient.matchAllTags, [false])
     }
 
     @MainActor
-    func testWorkshopBrowserFillsDisplayedPageFromMultipleTypedCursorRounds() async throws {
-        let firstVideoItems = (1...20).map {
-            Self.workshopItemJSON(id: "10\(String(format: "%02d", $0))", title: "Video \($0)", type: "video")
+    func testWorkshopBrowserLoadsNextPageWithSteamCursor() async throws {
+        let firstPageItems = (1...24).map {
+            Self.workshopItemJSON(id: "10\(String(format: "%02d", $0))", title: "Workshop \($0)", type: $0.isMultiple(of: 2) ? "web" : "video")
         }
-        let firstWebItems = (1...10).map {
-            Self.workshopItemJSON(id: "20\(String(format: "%02d", $0))", title: "Web \($0)", type: "web")
-        }
-        let secondVideoItems = (21...45).map {
-            Self.workshopItemJSON(id: "10\(String(format: "%02d", $0))", title: "Video \($0)", type: "video")
-        }
+        let secondPageItems = [
+            Self.workshopItemJSON(id: "2001", title: "Second Page Video", type: "video"),
+            Self.workshopItemJSON(id: "2002", title: "Second Page Web", type: "web")
+        ]
         let httpClient = FakeSteamWorkshopHTTPClient(responses: [
-            Self.workshopResponseJSON(nextCursor: "video-cursor-2", items: firstVideoItems),
-            Self.workshopResponseJSON(nextCursor: nil, items: firstWebItems),
-            Self.workshopResponseJSON(nextCursor: nil, items: secondVideoItems)
+            Self.workshopResponseJSON(nextCursor: "cursor-2", items: firstPageItems),
+            Self.workshopResponseJSON(nextCursor: nil, items: secondPageItems)
         ])
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -327,25 +319,28 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         viewModel.apiKey = "steam-api-key"
 
         await viewModel.browse()
+        await viewModel.loadNextPage()
 
-        XCTAssertEqual(viewModel.currentPageNumber, 1)
-        XCTAssertEqual(viewModel.items.count, 36)
-        XCTAssertTrue(viewModel.canLoadNextPage)
-        XCTAssertEqual(httpClient.requiredTags, ["Video", "Web", "Video"])
-        XCTAssertEqual(httpClient.cursors, ["*", "*", "video-cursor-2"])
+        XCTAssertEqual(viewModel.currentPageNumber, 2)
+        XCTAssertEqual(viewModel.items.map(\.id), ["2001", "2002"])
+        XCTAssertFalse(viewModel.canLoadNextPage)
+        XCTAssertTrue(viewModel.canLoadPreviousPage)
+        XCTAssertEqual(httpClient.requiredTags, ["Video,Web", "Video,Web"])
+        XCTAssertEqual(httpClient.cursors, ["*", "cursor-2"])
+        XCTAssertEqual(httpClient.pageSizes, [24, 24])
+        XCTAssertEqual(httpClient.matchAllTags, [false, false])
     }
 
     @MainActor
     func testWorkshopBrowserKeepsBrowseQueryStableWhenLoadingNextPage() async throws {
-        let firstVideoItems = (1...36).map {
+        let firstPageItems = (1...24).map {
             Self.workshopItemJSON(id: "30\(String(format: "%02d", $0))", title: "City Video \($0)", type: "video")
         }
-        let firstWebItems = (1...36).map {
-            Self.workshopItemJSON(id: "40\(String(format: "%02d", $0))", title: "City Web \($0)", type: "web")
-        }
         let httpClient = FakeSteamWorkshopHTTPClient(responses: [
-            Self.workshopResponseJSON(nextCursor: nil, items: firstVideoItems),
-            Self.workshopResponseJSON(nextCursor: nil, items: firstWebItems)
+            Self.workshopResponseJSON(nextCursor: "city-cursor-2", items: firstPageItems),
+            Self.workshopResponseJSON(nextCursor: nil, items: [
+                Self.workshopItemJSON(id: "4001", title: "City Web", type: "web")
+            ])
         ])
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -372,7 +367,8 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             SteamWorkshopQuery.Sort.search.queryType,
             SteamWorkshopQuery.Sort.search.queryType
         ])
-        XCTAssertEqual(httpClient.requiredTags, ["Video", "Web"])
+        XCTAssertEqual(httpClient.requiredTags, ["Video,Web", "Video,Web"])
+        XCTAssertEqual(httpClient.cursors, ["*", "city-cursor-2"])
     }
 
     @MainActor
@@ -381,12 +377,7 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             Self.workshopResponseJSON(
                 nextCursor: nil,
                 items: [
-                    Self.workshopItemJSON(id: "1001", title: "Video One", type: "video")
-                ]
-            ),
-            Self.workshopResponseJSON(
-                nextCursor: nil,
-                items: [
+                    Self.workshopItemJSON(id: "1001", title: "Video One", type: "video"),
                     Self.workshopItemJSON(id: "2001", title: "Web One", type: "web")
                 ]
             )
@@ -409,24 +400,19 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001"])
         XCTAssertFalse(viewModel.canLoadNextPage)
         XCTAssertEqual(viewModel.statusMessage, "Loaded page 1 with 2 playable Workshop items.")
+        XCTAssertEqual(httpClient.requiredTags, ["Video,Web"])
     }
 
     @MainActor
-    func testWorkshopBrowserSortsLatestMergedPageByTimeCreated() async throws {
+    func testWorkshopBrowserKeepsSteamPageOrderForLatestResults() async throws {
         let httpClient = FakeSteamWorkshopHTTPClient(responses: [
             Self.workshopResponseJSON(
                 nextCursor: nil,
                 items: [
                     Self.workshopItemJSON(id: "1001", title: "Older Video", type: "video", timeCreated: 100),
+                    Self.workshopItemJSON(id: "2001", title: "Middle Web", type: "web", timeCreated: 300),
                     Self.workshopItemJSON(id: "1002", title: "Newest Video", type: "video", timeCreated: 400)
                 ]
-            ),
-            Self.workshopResponseJSON(
-                nextCursor: nil,
-                items: [
-                    Self.workshopItemJSON(id: "2001", title: "Middle Web", type: "web", timeCreated: 300),
-                    Self.workshopItemJSON(id: "2002", title: "Oldest Web", type: "web", timeCreated: 50)
-                ]
             )
         ])
         let root = FileManager.default.temporaryDirectory
@@ -445,22 +431,30 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
 
         await viewModel.browse()
 
-        XCTAssertEqual(viewModel.items.map(\.id), ["1002", "2001", "1001", "2002"])
+        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001", "1002"])
+        XCTAssertEqual(httpClient.requiredTags, ["Video,Web"])
+        XCTAssertEqual(httpClient.queryTypes, [SteamWorkshopQuery.Sort.latest.queryType])
     }
 
     @MainActor
-    func testWorkshopBrowserKeepsLatestArrivalOrderWhenTimeCreatedIsMissing() async throws {
+    func testWorkshopBrowserResetsPagesAndSelectionWhenBrowseQueryChanges() async throws {
         let httpClient = FakeSteamWorkshopHTTPClient(responses: [
             Self.workshopResponseJSON(
-                nextCursor: nil,
+                nextCursor: "cursor-2",
                 items: [
-                    Self.workshopItemJSON(id: "1001", title: "Untimed Video", type: "video")
+                    Self.workshopItemJSON(id: "1001", title: "First Query", type: "video")
                 ]
             ),
             Self.workshopResponseJSON(
                 nextCursor: nil,
                 items: [
-                    Self.workshopItemJSON(id: "2001", title: "Timed Web", type: "web", timeCreated: 999)
+                    Self.workshopItemJSON(id: "2001", title: "First Query Page 2", type: "web")
+                ]
+            ),
+            Self.workshopResponseJSON(
+                nextCursor: nil,
+                items: [
+                    Self.workshopItemJSON(id: "3001", title: "Second Query", type: "video")
                 ]
             )
         ])
@@ -476,28 +470,25 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             )
         )
         viewModel.apiKey = "steam-api-key"
-        viewModel.sort = .latest
 
         await viewModel.browse()
+        await viewModel.loadNextPage()
+        viewModel.searchText = "rain"
+        await viewModel.browse()
 
-        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001"])
+        XCTAssertEqual(viewModel.currentPageNumber, 1)
+        XCTAssertFalse(viewModel.canLoadPreviousPage)
+        XCTAssertFalse(viewModel.canLoadNextPage)
+        XCTAssertEqual(viewModel.items.map(\.id), ["3001"])
+        XCTAssertEqual(viewModel.selectedItem?.id, "3001")
+        XCTAssertEqual(httpClient.searchTexts, [nil, nil, "rain"])
+        XCTAssertEqual(httpClient.cursors, ["*", "cursor-2", "*"])
     }
 
     @MainActor
-    func testWorkshopBrowserKeepsLatestArrivalOrderForEqualTimeCreated() async throws {
+    func testWorkshopBrowserShowsErrorWhenCombinedTagRequestFails() async throws {
         let httpClient = FakeSteamWorkshopHTTPClient(responses: [
-            Self.workshopResponseJSON(
-                nextCursor: nil,
-                items: [
-                    Self.workshopItemJSON(id: "1001", title: "First Video", type: "video", timeCreated: 500)
-                ]
-            ),
-            Self.workshopResponseJSON(
-                nextCursor: nil,
-                items: [
-                    Self.workshopItemJSON(id: "2001", title: "Second Web", type: "web", timeCreated: 500)
-                ]
-            )
+            "{}".data(using: .utf8)!
         ])
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -511,11 +502,14 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             )
         )
         viewModel.apiKey = "steam-api-key"
-        viewModel.sort = .latest
 
         await viewModel.browse()
 
-        XCTAssertEqual(viewModel.items.map(\.id), ["1001", "2001"])
+        XCTAssertEqual(viewModel.items, [])
+        XCTAssertEqual(httpClient.requiredTags, ["Video,Web"])
+        XCTAssertFalse(httpClient.requiredTags.contains("Video"))
+        XCTAssertFalse(httpClient.requiredTags.contains("Web"))
+        XCTAssertFalse(viewModel.statusMessage.isEmpty)
     }
 
     func testSteamCMDDownloadArgumentsForceWindowsAndNeverSubscribe() {
