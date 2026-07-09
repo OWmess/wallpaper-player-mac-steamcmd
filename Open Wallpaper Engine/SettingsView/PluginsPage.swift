@@ -48,7 +48,7 @@ struct PluginsPage: SettingsPage {
 
             Section {
                 TextField("Steam username", text: $steamUsername)
-                Text("The app stores this username only. Steam passwords stay in the download form for one run and are not saved by Open Wallpaper Engine. Saved Session reuses SteamCMD's own login files in the runtime.")
+                Text("The app stores this username only. Steam passwords and Steam Guard codes stay in the download form for one run and are not saved by Open Wallpaper Engine. When SteamCMD keeps a valid login in its runtime, downloads can reuse it automatically.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {

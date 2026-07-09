@@ -828,6 +828,12 @@
         }
       }
     },
+    "Hide Advanced" : {
+
+    },
+    "Hide advanced controls" : {
+
+    },
     "Hide Others" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1023,9 +1029,6 @@
           }
         }
       }
-    },
-    "Login" : {
-
     },
     "Low" : {
       "localizations" : {
@@ -1866,6 +1869,9 @@
         }
       }
     },
+    "Show advanced controls" : {
+
+    },
     "Show Filter Results" : {
       "localizations" : {
         "zh-Hans" : {
@@ -2036,7 +2042,7 @@
     "The app manages SteamCMD in a private runtime and executes the SteamCMD binary through the bundled runner. Install only creates missing files; Repair runs SteamCMD's own check/update. Clearing the session removes SteamCMD login state but keeps downloaded Workshop content." : {
 
     },
-    "The app stores this username only. Steam passwords stay in the download form for one run and are not saved by Open Wallpaper Engine. Saved Session reuses SteamCMD's own login files in the runtime." : {
+    "The app stores this username only. Steam passwords and Steam Guard codes stay in the download form for one run and are not saved by Open Wallpaper Engine. When SteamCMD keeps a valid login in its runtime, downloads can reuse it automatically." : {
 
     },
     "Theme" : {

@@ -322,6 +322,7 @@ struct SteamWorkshopStats: Equatable {
 enum SteamCMDOutputEvent: Equatable {
     case loginSucceeded
     case steamGuardRequired
+    case loginFailed
     case downloadSucceeded(itemID: String)
     case downloadFailed
 }
@@ -331,6 +332,9 @@ enum SteamCMDOutputParser {
         let lowercased = line.lowercased()
         if lowercased.contains("steam guard") {
             return .steamGuardRequired
+        }
+        if isLoginFailureLine(line) {
+            return .loginFailed
         }
         if lowercased.contains("waiting for user info") && lowercased.contains("ok") {
             return .loginSucceeded
@@ -343,6 +347,44 @@ enum SteamCMDOutputParser {
             return .downloadFailed
         }
         return nil
+    }
+
+    static func isLoginFailureLine(_ line: String) -> Bool {
+        let lowercased = line.lowercased()
+        return [
+            "login failure",
+            "failed to login",
+            "invalid password",
+            "account logon denied",
+            "logon failure"
+        ].contains { lowercased.contains($0) }
+    }
+
+    static func downloadedItemDirectory(from line: String) -> URL? {
+        let lowercased = line.lowercased()
+        guard lowercased.contains("downloaded item"),
+              let toRange = line.range(of: " to ", options: .caseInsensitive) else {
+            return nil
+        }
+
+        let remainder = line[toRange.upperBound...]
+        guard let openingQuote = remainder.firstIndex(of: "\"") else {
+            return nil
+        }
+        let pathStart = remainder.index(after: openingQuote)
+        guard let closingQuote = remainder[pathStart...].firstIndex(of: "\"") else {
+            return nil
+        }
+        return URL(fileURLWithPath: String(remainder[pathStart..<closingQuote]), isDirectory: true)
+    }
+
+    static func failedItemID(from line: String) -> String? {
+        let lowercased = line.lowercased()
+        guard lowercased.contains("download item"),
+              lowercased.contains("failed") else {
+            return nil
+        }
+        return firstNumber(after: "item", in: line)
     }
 
     private static func firstNumber(after marker: String, in line: String) -> String? {
@@ -785,6 +827,33 @@ struct SteamCMDPaths: Equatable {
         return uniqueURLs(urls)
     }
 
+    func loginSessionIndicatorURLs(fileManager: FileManager = .default) -> [URL] {
+        var urls = [
+            steamHomeDirectory
+                .appendingPathComponent("config", isDirectory: true)
+                .appendingPathComponent("config.vdf"),
+            steamHomeDirectory
+                .appendingPathComponent("config", isDirectory: true)
+                .appendingPathComponent("loginusers.vdf"),
+            steamCMDDirectory
+                .appendingPathComponent("config", isDirectory: true)
+                .appendingPathComponent("config.vdf"),
+            steamCMDDirectory
+                .appendingPathComponent("config", isDirectory: true)
+                .appendingPathComponent("loginusers.vdf")
+        ]
+        for directory in [steamHomeDirectory, steamCMDDirectory] {
+            if let contents = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) {
+                urls += contents.filter { $0.lastPathComponent.lowercased().hasPrefix("ssfn") }
+            }
+        }
+        return uniqueURLs(urls)
+    }
+
     private func uniqueURLs(_ urls: [URL]) -> [URL] {
         var seen = Set<String>()
         return urls.filter { url in
@@ -871,6 +940,12 @@ struct SteamCMDPathResolution: Equatable {
     func loginSessionCandidateURLs(fileManager: FileManager = .default) -> [URL] {
         uniquePaths([paths] + legacyPaths).flatMap {
             $0.loginSessionCandidateURLs(fileManager: fileManager)
+        }
+    }
+
+    func loginSessionIndicatorURLs(fileManager: FileManager = .default) -> [URL] {
+        uniquePaths([paths] + legacyPaths).flatMap {
+            $0.loginSessionIndicatorURLs(fileManager: fileManager)
         }
     }
 
@@ -963,6 +1038,9 @@ enum SteamCMDPathResolver {
 enum SteamCMDError: LocalizedError {
     case installFailed(recentOutput: [String])
     case commandFailed(status: Int32, recentOutput: [String])
+    case steamGuardRequired(recentOutput: [String])
+    case loginFailed(recentOutput: [String])
+    case downloadFailed(itemID: String?, recentOutput: [String])
 
     var errorDescription: String? {
         switch self {
@@ -976,6 +1054,19 @@ enum SteamCMDError: LocalizedError {
                 base: "SteamCMD exited with status \(status).",
                 recentOutput: recentOutput
             )
+        case .steamGuardRequired(let recentOutput):
+            return Self.message(
+                base: "Steam Guard required. Enter the current code and try again.",
+                recentOutput: recentOutput
+            )
+        case .loginFailed(let recentOutput):
+            return Self.message(
+                base: "SteamCMD login failed. Check your Steam username, password, and Steam Guard code.",
+                recentOutput: recentOutput
+            )
+        case .downloadFailed(let itemID, let recentOutput):
+            let base = itemID.map { "SteamCMD download failed for item \($0)." } ?? "SteamCMD download failed."
+            return Self.message(base: base, recentOutput: recentOutput)
         }
     }
 
@@ -1467,14 +1558,45 @@ struct SteamCMDRunnerCore {
         let command = SteamCMDDownloadCommand(itemID: itemID, login: login)
         let recentOutput = RecentProcessOutput()
         var parser = SteamCMDOutputStreamParser()
+        var downloadedItemURL: URL?
+        var failedItemID: String?
+        var sawSteamGuardRequired = false
+        var sawLoginFailure = false
         let status = try await runSteamCMD(
             arguments: command.arguments,
             recentOutput: recentOutput
         ) { line in
             recentOutput.append(line)
+            if let directory = SteamCMDOutputParser.downloadedItemDirectory(from: line) {
+                downloadedItemURL = directory
+            }
+            if let itemID = SteamCMDOutputParser.failedItemID(from: line) {
+                failedItemID = itemID
+            }
             if let event = parser.event(from: line) {
+                switch event {
+                case .steamGuardRequired:
+                    sawSteamGuardRequired = true
+                case .loginFailed:
+                    sawLoginFailure = true
+                case .loginSucceeded, .downloadSucceeded, .downloadFailed:
+                    break
+                }
                 output(event)
             }
+        }
+
+        if downloadedItemURL == nil {
+            if sawSteamGuardRequired {
+                throw SteamCMDError.steamGuardRequired(recentOutput: recentOutput.lines)
+            }
+            if sawLoginFailure {
+                throw SteamCMDError.loginFailed(recentOutput: recentOutput.lines)
+            }
+        }
+
+        if let failedItemID {
+            throw SteamCMDError.downloadFailed(itemID: failedItemID, recentOutput: recentOutput.lines)
         }
 
         guard status == 0 else {
@@ -1483,7 +1605,7 @@ struct SteamCMDRunnerCore {
 
         return SteamCMDRunnerResult(
             runtimeURL: paths.steamCMDDirectory,
-            downloadedItemURL: paths.workshopContentDirectory.appendingPathComponent(itemID, isDirectory: true),
+            downloadedItemURL: downloadedItemURL ?? paths.workshopContentDirectory.appendingPathComponent(itemID, isDirectory: true),
             recentOutput: recentOutput.lines
         )
     }
@@ -1597,6 +1719,16 @@ enum SteamCMDRunnerXPCPayload {
                 payload["errorKind"] = "commandFailed"
                 payload["status"] = status
                 payload["recentOutput"] = recentOutput
+            case .steamGuardRequired(let recentOutput):
+                payload["errorKind"] = "steamGuardRequired"
+                payload["recentOutput"] = recentOutput
+            case .loginFailed(let recentOutput):
+                payload["errorKind"] = "loginFailed"
+                payload["recentOutput"] = recentOutput
+            case .downloadFailed(let itemID, let recentOutput):
+                payload["errorKind"] = "downloadFailed"
+                payload["itemID"] = itemID
+                payload["recentOutput"] = recentOutput
             }
         } else {
             payload["errorKind"] = "unknown"
@@ -1623,6 +1755,18 @@ enum SteamCMDRunnerXPCPayload {
         if payload["errorKind"] as? String == "commandFailed" {
             return SteamCMDError.commandFailed(
                 status: (payload["status"] as? NSNumber)?.int32Value ?? -1,
+                recentOutput: recentOutput
+            )
+        }
+        if payload["errorKind"] as? String == "steamGuardRequired" {
+            return SteamCMDError.steamGuardRequired(recentOutput: recentOutput)
+        }
+        if payload["errorKind"] as? String == "loginFailed" {
+            return SteamCMDError.loginFailed(recentOutput: recentOutput)
+        }
+        if payload["errorKind"] as? String == "downloadFailed" {
+            return SteamCMDError.downloadFailed(
+                itemID: payload["itemID"] as? String,
                 recentOutput: recentOutput
             )
         }
@@ -1889,6 +2033,28 @@ struct SteamCMDService {
         try await client.clearLoginSession()
     }
 
+    func hasSavedLoginSession() -> Bool {
+        resolution.loginSessionIndicatorURLs(fileManager: fileManager).contains { url in
+            var isDirectory = ObjCBool(false)
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue else {
+                return false
+            }
+
+            let filename = url.lastPathComponent.lowercased()
+            if filename.hasPrefix("ssfn") || filename == "loginusers.vdf" {
+                return true
+            }
+
+            guard filename == "config.vdf",
+                  let data = try? Data(contentsOf: url),
+                  let contents = String(data: data, encoding: .utf8)?.lowercased() else {
+                return false
+            }
+            return contents.contains("\"accounts\"")
+        }
+    }
+
     func resetRuntime() throws {
         if fileManager.fileExists(atPath: paths.steamCMDDirectory.path) {
             try fileManager.removeItem(at: paths.steamCMDDirectory)
@@ -1937,35 +2103,31 @@ enum WallpaperLibraryService {
     }
 }
 
-enum SteamWorkshopCredentialStore {
-    private static let service = "com.haren724.open-wallpaper-engine.steam-workshop"
-    private static let apiKeyAccount = "steam-web-api-key"
+struct KeychainCredentialKey: Hashable {
+    let service: String
+    let account: String
+}
 
-    enum KeychainError: LocalizedError {
-        case unhandledStatus(OSStatus)
+protocol KeychainCredentialBackend {
+    func loadString(for key: KeychainCredentialKey) throws -> String?
+    func saveString(_ string: String, for key: KeychainCredentialKey) throws
+    func deleteString(for key: KeychainCredentialKey) throws
+}
 
-        var errorDescription: String? {
-            switch self {
-            case .unhandledStatus(let status):
-                return "Keychain operation failed with status \(status)."
-            }
+enum KeychainCredentialStoreError: LocalizedError {
+    case unhandledStatus(OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .unhandledStatus(let status):
+            return "Keychain operation failed with status \(status)."
         }
     }
+}
 
-    static func saveAPIKey(_ apiKey: String) throws {
-        let query = baseQuery(account: apiKeyAccount)
-        SecItemDelete(query as CFDictionary)
-
-        var attributes = query
-        attributes[kSecValueData as String] = Data(apiKey.utf8)
-        let status = SecItemAdd(attributes as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw KeychainError.unhandledStatus(status)
-        }
-    }
-
-    static func loadAPIKey() throws -> String? {
-        var query = baseQuery(account: apiKeyAccount)
+struct SystemKeychainCredentialBackend: KeychainCredentialBackend {
+    func loadString(for key: KeychainCredentialKey) throws -> String? {
+        var query = baseQuery(for: key)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
@@ -1975,7 +2137,7 @@ enum SteamWorkshopCredentialStore {
             return nil
         }
         guard status == errSecSuccess else {
-            throw KeychainError.unhandledStatus(status)
+            throw KeychainCredentialStoreError.unhandledStatus(status)
         }
         guard let data = result as? Data else {
             return nil
@@ -1983,19 +2145,107 @@ enum SteamWorkshopCredentialStore {
         return String(data: data, encoding: .utf8)
     }
 
-    static func deleteAPIKey() throws {
-        let status = SecItemDelete(baseQuery(account: apiKeyAccount) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainError.unhandledStatus(status)
+    func saveString(_ string: String, for key: KeychainCredentialKey) throws {
+        let query = baseQuery(for: key)
+        SecItemDelete(query as CFDictionary)
+
+        var attributes = query
+        attributes[kSecValueData as String] = Data(string.utf8)
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw KeychainCredentialStoreError.unhandledStatus(status)
         }
     }
 
-    private static func baseQuery(account: String) -> [String: Any] {
+    func deleteString(for key: KeychainCredentialKey) throws {
+        let status = SecItemDelete(baseQuery(for: key) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainCredentialStoreError.unhandledStatus(status)
+        }
+    }
+
+    private func baseQuery(for key: KeychainCredentialKey) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
+            kSecAttrService as String: key.service,
+            kSecAttrAccount as String: key.account
         ]
+    }
+}
+
+final class CachedKeychainCredentialStore {
+    private enum CachedValue {
+        case string(String)
+        case missing
+
+        var stringValue: String? {
+            switch self {
+            case .string(let string):
+                return string
+            case .missing:
+                return nil
+            }
+        }
+    }
+
+    private let backend: KeychainCredentialBackend
+    private let queue = DispatchQueue(label: "com.haren724.open-wallpaper-engine.keychain-credential-cache")
+    private var cache = [KeychainCredentialKey: CachedValue]()
+
+    init(backend: KeychainCredentialBackend = SystemKeychainCredentialBackend()) {
+        self.backend = backend
+    }
+
+    func loadString(for key: KeychainCredentialKey) throws -> String? {
+        try queue.sync {
+            if let cachedValue = cache[key] {
+                return cachedValue.stringValue
+            }
+
+            let string = try backend.loadString(for: key)
+            if let string = string {
+                cache[key] = .string(string)
+            } else {
+                cache[key] = .missing
+            }
+            return string
+        }
+    }
+
+    func saveString(_ string: String, for key: KeychainCredentialKey) throws {
+        try queue.sync {
+            try backend.saveString(string, for: key)
+            cache[key] = .string(string)
+        }
+    }
+
+    func deleteString(for key: KeychainCredentialKey) throws {
+        try queue.sync {
+            try backend.deleteString(for: key)
+            cache[key] = .missing
+        }
+    }
+}
+
+enum SteamWorkshopCredentialStore {
+    private static let apiKey = KeychainCredentialKey(
+        service: "com.haren724.open-wallpaper-engine.steam-workshop",
+        account: "steam-web-api-key"
+    )
+    private static let credentialStore = CachedKeychainCredentialStore()
+
+    typealias KeychainError = KeychainCredentialStoreError
+
+    static func saveAPIKey(_ apiKey: String) throws {
+        try credentialStore.saveString(apiKey, for: Self.apiKey)
+    }
+
+    static func loadAPIKey() throws -> String? {
+        try credentialStore.loadString(for: Self.apiKey)
+    }
+
+    static func deleteAPIKey() throws {
+        try credentialStore.deleteString(for: Self.apiKey)
     }
 }
 
@@ -2018,28 +2268,9 @@ enum SteamWorkshopDownloadInputError: LocalizedError {
         case .invalidWorkshopID:
             return "Enter a valid Steam Workshop URL or published file ID."
         case .missingUsername:
-            return "Enter your Steam username for this login mode."
+            return "Enter your Steam username to sign in to SteamCMD."
         case .missingPassword:
-            return "Enter your Steam password, or switch to Saved Session if you have already logged in."
-        }
-    }
-}
-
-enum SteamWorkshopLoginMode: String, CaseIterable, Identifiable {
-    case anonymous
-    case savedSession
-    case password
-
-    var id: Self { self }
-
-    var title: String {
-        switch self {
-        case .anonymous:
-            return "Anonymous"
-        case .savedSession:
-            return "Saved Session"
-        case .password:
-            return "Password Login"
+            return "Enter your Steam password to sign in to SteamCMD."
         }
     }
 }
@@ -2051,12 +2282,11 @@ struct SteamWorkshopDownloadRequest: Equatable {
 
 struct SteamWorkshopDownloadInput: Equatable {
     var itemInput: String
-    var loginMode: SteamWorkshopLoginMode = .anonymous
     var username: String
     var password: String
     var steamGuardCode: String
 
-    func makeRequest() throws -> SteamWorkshopDownloadRequest {
+    func makePasswordRequest() throws -> SteamWorkshopDownloadRequest {
         guard let itemID = SteamWorkshopIDParser.publishedFileID(from: itemInput) else {
             throw SteamWorkshopDownloadInputError.invalidWorkshopID
         }
@@ -2065,29 +2295,20 @@ struct SteamWorkshopDownloadInput: Equatable {
         let trimmedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedSteamGuardCode = steamGuardCode.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        switch loginMode {
-        case .anonymous:
-            return SteamWorkshopDownloadRequest(itemID: itemID, login: .anonymous)
-        case .savedSession:
-            guard !trimmedUsername.isEmpty else {
-                throw SteamWorkshopDownloadInputError.missingUsername
-            }
-            return SteamWorkshopDownloadRequest(itemID: itemID, login: .savedSession(username: trimmedUsername))
-        case .password:
-            guard !trimmedUsername.isEmpty else {
-                throw SteamWorkshopDownloadInputError.missingUsername
-            }
-            guard !trimmedPassword.isEmpty else {
-                throw SteamWorkshopDownloadInputError.missingPassword
-            }
-            return SteamWorkshopDownloadRequest(
-                itemID: itemID,
-                login: .account(
-                    username: trimmedUsername,
-                    password: trimmedPassword,
-                    steamGuardCode: trimmedSteamGuardCode.isEmpty ? nil : trimmedSteamGuardCode
-                )
-            )
+        guard !trimmedUsername.isEmpty else {
+            throw SteamWorkshopDownloadInputError.missingUsername
         }
+        guard !trimmedPassword.isEmpty else {
+            throw SteamWorkshopDownloadInputError.missingPassword
+        }
+
+        return SteamWorkshopDownloadRequest(
+            itemID: itemID,
+            login: .account(
+                username: trimmedUsername,
+                password: trimmedPassword,
+                steamGuardCode: trimmedSteamGuardCode.isEmpty ? nil : trimmedSteamGuardCode
+            )
+        )
     }
 }

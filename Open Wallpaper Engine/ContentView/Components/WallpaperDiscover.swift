@@ -81,6 +81,17 @@ private struct WorkshopBrowseFetchResult {
     var page: WorkshopBrowsePage
 }
 
+private enum SteamWorkshopRuntimeLoginState: Equatable {
+    case passwordRequired
+    case reusableSavedSession(username: String)
+    case invalidSavedSession(username: String)
+
+    var reusableSavedSessionUsername: String? {
+        guard case .reusableSavedSession(let username) = self else { return nil }
+        return username
+    }
+}
+
 struct SteamWorkshopBrowserLayoutPolicy {
     enum Presentation: Equatable {
         case sideBySide
@@ -125,13 +136,13 @@ struct WallpaperDiscover: View {
 final class SteamWorkshopBrowserViewModel: ObservableObject {
     private static let displayedPageSize = 24
     private static let videoWebTags = "Video,Web"
+    private static let usernameDefaultsKey = "SteamWorkshopUsername"
 
     @Published var apiKey = ""
     @Published var sort = SteamWorkshopQuery.Sort.popular
     @Published var searchText = ""
     @Published var manualItemInput = ""
-    @Published var loginMode = SteamWorkshopLoginMode.anonymous
-    @Published var username = UserDefaults.standard.string(forKey: "SteamWorkshopUsername") ?? ""
+    @Published var username = UserDefaults.standard.string(forKey: usernameDefaultsKey) ?? ""
     @Published var password = ""
     @Published var steamGuardCode = ""
     @Published var items = [SteamWorkshopItem]()
@@ -146,15 +157,18 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
     private let apiService: SteamWorkshopAPIService
     private var steamCMDService: SteamCMDService
     private var pageState: WorkshopPageState?
+    private var runtimeLoginState = SteamWorkshopRuntimeLoginState.passwordRequired
 
     init(
         apiService: SteamWorkshopAPIService = SteamWorkshopAPIService(),
-        steamCMDResolution: SteamCMDPathResolution = SteamCMDPathResolver.resolve()
+        steamCMDResolution: SteamCMDPathResolution = SteamCMDPathResolver.resolve(),
+        steamCMDService: SteamCMDService? = nil
     ) {
         self.apiService = apiService
         self.steamCMDResolution = steamCMDResolution
-        self.steamCMDService = SteamCMDService(resolution: steamCMDResolution)
+        self.steamCMDService = steamCMDService ?? SteamCMDService(resolution: steamCMDResolution)
         refreshInstallState()
+        refreshSavedLoginSessionAvailability()
     }
 
     var steamCMDDirectoryPath: String {
@@ -210,6 +224,7 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
         steamCMDResolution = resolution
         steamCMDService = SteamCMDService(resolution: resolution)
         refreshInstallState()
+        refreshSavedLoginSessionAvailability()
     }
 
     private func refreshInstallState() {
@@ -225,10 +240,40 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
         }
     }
 
+    private func refreshSavedLoginSessionAvailability() {
+        let sessionAvailable = steamCMDService.hasSavedLoginSession()
+        let savedUsername = Self.savedWorkshopUsername()
+        if case .invalidSavedSession(let username) = runtimeLoginState,
+           sessionAvailable,
+           savedUsername == username {
+            return
+        }
+        runtimeLoginState = Self.makeRuntimeLoginState(
+            savedSessionAvailable: sessionAvailable,
+            username: savedUsername
+        )
+    }
+
+    private static func savedWorkshopUsername() -> String {
+        (UserDefaults.standard.string(forKey: usernameDefaultsKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func makeRuntimeLoginState(
+        savedSessionAvailable: Bool,
+        username: String
+    ) -> SteamWorkshopRuntimeLoginState {
+        guard savedSessionAvailable, !username.isEmpty else {
+            return .passwordRequired
+        }
+        return .reusableSavedSession(username: username)
+    }
+
     func resetSteamCMDRuntime() {
         do {
             try steamCMDService.resetRuntime()
             refreshInstallState()
+            refreshSavedLoginSessionAvailability()
             statusMessage = "SteamCMD runtime reset. Install again to rebuild it."
         } catch {
             statusMessage = error.localizedDescription
@@ -377,6 +422,7 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
                 }
             }
             installState = .installed(steamCMDService.paths.executableURL)
+            refreshSavedLoginSessionAvailability()
             return true
         } catch {
             installState = .failed(error.localizedDescription)
@@ -394,6 +440,7 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
                 }
             }
             installState = .installed(steamCMDService.paths.executableURL)
+            refreshSavedLoginSessionAvailability()
             statusMessage = "SteamCMD runtime repaired."
             return true
         } catch {
@@ -404,10 +451,6 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
     }
 
     func download(itemID overrideItemID: String? = nil) async -> WEWallpaper? {
-        guard await ensureSteamCMDInstalled() else {
-            return nil
-        }
-
         isDownloading = true
         defer {
             isDownloading = false
@@ -415,35 +458,103 @@ final class SteamWorkshopBrowserViewModel: ObservableObject {
             steamGuardCode = ""
         }
 
+        var attemptedLogin: SteamCMDLogin?
         do {
-            UserDefaults.standard.set(username, forKey: "SteamWorkshopUsername")
-            let input = SteamWorkshopDownloadInput(
-                itemInput: overrideItemID ?? manualItemInput,
-                loginMode: loginMode,
-                username: username,
-                password: password,
-                steamGuardCode: steamGuardCode
-            )
-            let request = try input.makeRequest()
+            refreshSavedLoginSessionAvailability()
+            let request = try makeDownloadRequest(itemInput: overrideItemID ?? manualItemInput)
+            attemptedLogin = request.login
             manualItemInput = request.itemID
+            guard await ensureSteamCMDInstalled() else {
+                return nil
+            }
             statusMessage = "Starting SteamCMD download for \(request.itemID)..."
             let directory = try await steamCMDService.downloadItem(
                 itemID: request.itemID,
                 login: request.login
             ) { [weak self] event in
                 Task { @MainActor in
+                    if case .loginSucceeded = event {
+                        _ = self?.persistSuccessfulUsername(for: request.login)
+                    }
                     self?.statusMessage = event.statusText
                 }
             }
+            _ = persistSuccessfulUsername(for: request.login)
+            refreshSavedLoginSessionAvailability()
+            var isDirectory = ObjCBool(false)
+            guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else {
+                statusMessage = "SteamCMD did not create a download folder for \(request.itemID)."
+                return nil
+            }
             let wallpaper = WorkshopLibraryService.scanDownloadedWallpapers(at: directory).first
             statusMessage = wallpaper == nil
-                ? "Download finished, but no playable project.json was found."
+                ? "Downloaded \(request.itemID), but no playable project.json was found at \(directory.path)."
                 : "Downloaded \(wallpaper?.project.title ?? request.itemID)."
             return wallpaper
         } catch {
-            statusMessage = error.localizedDescription
+            if !handleDownloadError(error, attemptedLogin: attemptedLogin) {
+                statusMessage = error.localizedDescription
+            }
             return nil
         }
+    }
+
+    private func makeDownloadRequest(itemInput: String) throws -> SteamWorkshopDownloadRequest {
+        guard let itemID = SteamWorkshopIDParser.publishedFileID(from: itemInput) else {
+            throw SteamWorkshopDownloadInputError.invalidWorkshopID
+        }
+
+        let input = SteamWorkshopDownloadInput(
+            itemInput: itemID,
+            username: username,
+            password: password,
+            steamGuardCode: steamGuardCode
+        )
+        if password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let savedUsername = runtimeLoginState.reusableSavedSessionUsername else {
+                return try input.makePasswordRequest()
+            }
+            return SteamWorkshopDownloadRequest(itemID: itemID, login: .savedSession(username: savedUsername))
+        }
+        return try input.makePasswordRequest()
+    }
+
+    private func handleDownloadError(_ error: Error, attemptedLogin: SteamCMDLogin?) -> Bool {
+        guard let attemptedLogin else {
+            return false
+        }
+        guard case .savedSession(let username) = attemptedLogin else {
+            return false
+        }
+        guard let steamCMDError = error as? SteamCMDError else {
+            return false
+        }
+        switch steamCMDError {
+        case .steamGuardRequired, .loginFailed:
+            runtimeLoginState = .invalidSavedSession(username: username)
+            statusMessage = "Saved SteamCMD login expired. Enter your Steam password and current Steam Guard code, then download again."
+            return true
+        case .installFailed, .commandFailed, .downloadFailed:
+            return false
+        }
+    }
+
+    private func persistSuccessfulUsername(for login: SteamCMDLogin) -> Bool {
+        let usernameToPersist: String
+        switch login {
+        case .account(let username, _, _), .savedSession(let username):
+            usernameToPersist = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .anonymous:
+            return false
+        }
+        guard !usernameToPersist.isEmpty else {
+            return false
+        }
+        UserDefaults.standard.set(usernameToPersist, forKey: Self.usernameDefaultsKey)
+        username = usernameToPersist
+        runtimeLoginState = .reusableSavedSession(username: usernameToPersist)
+        return true
     }
 
     func openWorkshopPage(for item: SteamWorkshopItem) {
@@ -466,6 +577,8 @@ private extension SteamCMDOutputEvent {
             return "SteamCMD login succeeded."
         case .steamGuardRequired:
             return "Steam Guard required. Enter the code and download again."
+        case .loginFailed:
+            return "SteamCMD login failed."
         case .downloadSucceeded(let itemID):
             return "SteamCMD downloaded item \(itemID)."
         case .downloadFailed:
@@ -700,7 +813,6 @@ struct SteamWorkshopBrowser: View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 8) {
                 manualItemField
-                loginModePicker
                 usernameField
                 passwordField
                 steamGuardField
@@ -712,10 +824,7 @@ struct SteamWorkshopBrowser: View {
                     manualDownloadActions
                 }
                 HStack(spacing: 8) {
-                    loginModePicker
                     usernameField
-                }
-                HStack(spacing: 8) {
                     passwordField
                     steamGuardField
                 }
@@ -822,36 +931,22 @@ struct SteamWorkshopBrowser: View {
             .frame(minWidth: 220)
     }
 
-    private var loginModePicker: some View {
-        Picker("Login", selection: $viewModel.loginMode) {
-            ForEach(SteamWorkshopLoginMode.allCases) { mode in
-                Text(mode.title).tag(mode)
-            }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .frame(width: 330)
-    }
-
     private var usernameField: some View {
         TextField("Steam username", text: $viewModel.username)
             .textFieldStyle(.roundedBorder)
             .frame(width: 150)
-            .disabled(viewModel.loginMode == .anonymous)
     }
 
     private var passwordField: some View {
         SecureField("Steam password, not saved", text: $viewModel.password)
             .textFieldStyle(.roundedBorder)
             .frame(width: 220)
-            .disabled(viewModel.loginMode != .password)
     }
 
     private var steamGuardField: some View {
         TextField("Steam Guard", text: $viewModel.steamGuardCode)
             .textFieldStyle(.roundedBorder)
             .frame(width: 130)
-            .disabled(viewModel.loginMode != .password)
     }
 
     private var manualDownloadActions: some View {

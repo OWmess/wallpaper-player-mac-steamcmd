@@ -148,6 +148,25 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         )
     }
 
+    func testSteamCMDOutputParserRecognizesLoginFailure() {
+        XCTAssertEqual(
+            SteamCMDOutputParser.event(from: "Login Failure: Invalid Password"),
+            .loginFailed
+        )
+        XCTAssertEqual(
+            SteamCMDOutputParser.event(from: "FAILED to login with result code 5"),
+            .loginFailed
+        )
+    }
+
+    func testSteamCMDOutputParserExtractsDownloadedDirectory() throws {
+        let line = "Success. Downloaded item 3004222851 to \"/tmp/content/431960/3004222851\" (123 bytes)"
+
+        let directory = try XCTUnwrap(SteamCMDOutputParser.downloadedItemDirectory(from: line))
+
+        XCTAssertEqual(directory.path, "/tmp/content/431960/3004222851")
+    }
+
     func testWorkshopLibraryScannerReadsValidWallpaperProjects() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -263,6 +282,18 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertEqual(payload["query_type"] as? Int, 12)
         XCTAssertEqual(payload["search_text"] as? String, "city rain")
         XCTAssertEqual(payload["cursor"] as? String, "AoIIPw==")
+    }
+
+    func testWorkshopBrowserSourceDoesNotExposeSavedSessionPicker() throws {
+        let source = try String(
+            contentsOf: repositoryRoot()
+                .appendingPathComponent("Open Wallpaper Engine/ContentView/Components/WallpaperDiscover.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertFalse(source.contains("loginModePicker"))
+        XCTAssertFalse(source.contains("Saved Session"))
+        XCTAssertFalse(source.contains("Picker(\"Login\""))
     }
 
     @MainActor
@@ -548,6 +579,24 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains("+workshop_unsubscribe_item"))
     }
 
+    @MainActor
+    func testWorkshopDownloadInputOnlyBuildsPasswordLogin() throws {
+        let input = SteamWorkshopDownloadInput(
+            itemInput: "https://steamcommunity.com/sharedfiles/filedetails/?id=3004222851",
+            username: " alice ",
+            password: " secret ",
+            steamGuardCode: " 12345 "
+        )
+
+        let request = try input.makePasswordRequest()
+
+        XCTAssertEqual(request.itemID, "3004222851")
+        XCTAssertEqual(
+            request.login,
+            .account(username: "alice", password: "secret", steamGuardCode: "12345")
+        )
+    }
+
     func testSteamCMDPathsUseManagedRuntimeDirectory() {
         let root = URL(fileURLWithPath: "/tmp/OpenWallpaperEngineSteam", isDirectory: true)
         let paths = SteamCMDPaths(managedRuntimeRoot: root)
@@ -566,6 +615,28 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             root.appendingPathComponent("SteamCMDManaged/v1/steamapps/workshop/content/431960", isDirectory: true)
         ))
         XCTAssertFalse(paths.loginSessionCandidateURLs().contains(paths.workshopContentDirectory))
+    }
+
+    func testSteamCMDServiceDetectsSavedLoginSessionOnlyFromLoginState() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = SteamCMDPaths(applicationSupportDirectory: root)
+        let service = SteamCMDService(paths: paths)
+        let configDirectory = paths.steamHomeDirectory.appendingPathComponent("config", isDirectory: true)
+
+        try FileManager.default.createDirectory(at: configDirectory, withIntermediateDirectories: true)
+
+        XCTAssertFalse(service.hasSavedLoginSession())
+
+        let configFile = configDirectory.appendingPathComponent("config.vdf")
+        try Data(#""ConnectCache" { "server" "cached" }"#.utf8).write(to: configFile)
+
+        XCTAssertFalse(service.hasSavedLoginSession())
+
+        try Data(#""Accounts" { "alice" { "SteamID" "76561198000000000" } }"#.utf8).write(to: configFile)
+
+        XCTAssertTrue(service.hasSavedLoginSession())
     }
 
     func testSteamCMDPathResolverUsesManagedRuntimeAndKeepsLegacyWorkshopDirectories() {
@@ -1038,6 +1109,125 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         XCTAssertFalse(downloadCall.arguments.contains("+workshop_subscribe_item"))
         XCTAssertFalse(downloadCall.arguments.contains("+workshop_unsubscribe_item"))
         XCTAssertEqual(result.downloadedItemURL, paths.workshopContentDirectory.appendingPathComponent("3314492008", isDirectory: true))
+    }
+
+    func testSteamCMDRunnerCoreFailsWhenSteamCMDReportsDownloadFailureWithZeroExit() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = SteamCMDPaths(managedRuntimeRoot: root)
+        let runner = FakeProcessRunner()
+
+        try FileManager.default.createDirectory(at: paths.steamCMDDirectory, withIntermediateDirectories: true)
+        try writeExecutable("#!/usr/bin/env bash\n", to: paths.executableURL)
+        try writeExecutable("binary", to: paths.steamCMDExecutableURL)
+        runner.onRun = { executableURL, arguments, output, _ in
+            guard executableURL == paths.steamCMDExecutableURL,
+                  arguments.contains("+workshop_download_item") else { return }
+            output("[2026-07-09 00:20:18] ERROR! Download item 821372791 failed (Failure).")
+        }
+
+        let core = SteamCMDRunnerCore(paths: paths, processRunner: runner)
+
+        do {
+            _ = try await core.downloadItem(itemID: "821372791", login: .account(username: "alice", password: "secret", steamGuardCode: nil), output: { _ in })
+            XCTFail("Expected SteamCMD download failure output to fail the download")
+        } catch let error as SteamCMDError {
+            switch error {
+            case .downloadFailed(let itemID, let recentOutput):
+                XCTAssertEqual(itemID, "821372791")
+                XCTAssertEqual(recentOutput, ["[2026-07-09 00:20:18] ERROR! Download item 821372791 failed (Failure)."])
+            default:
+                XCTFail("Expected downloadFailed, got \(error)")
+            }
+        }
+    }
+
+    func testSteamCMDRunnerCoreThrowsSteamGuardRequiredForGuardPrompt() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = SteamCMDPaths(managedRuntimeRoot: root)
+        let runner = FakeProcessRunner()
+
+        try FileManager.default.createDirectory(at: paths.steamCMDDirectory, withIntermediateDirectories: true)
+        try writeExecutable("#!/usr/bin/env bash\n", to: paths.executableURL)
+        try writeExecutable("binary", to: paths.steamCMDExecutableURL)
+        runner.onRun = { executableURL, arguments, output, _ in
+            guard executableURL == paths.steamCMDExecutableURL,
+                  arguments.contains("+workshop_download_item") else { return }
+            output("Steam Guard code:")
+        }
+
+        let core = SteamCMDRunnerCore(paths: paths, processRunner: runner)
+
+        do {
+            _ = try await core.downloadItem(itemID: "3314492008", login: .savedSession(username: "alice"), output: { _ in })
+            XCTFail("Expected Steam Guard prompt to fail the download")
+        } catch let error as SteamCMDError {
+            switch error {
+            case .steamGuardRequired(let recentOutput):
+                XCTAssertEqual(recentOutput, ["Steam Guard code:"])
+            default:
+                XCTFail("Expected steamGuardRequired, got \(error)")
+            }
+        }
+    }
+
+    func testSteamCMDRunnerCoreThrowsLoginFailedForLoginFailureOutput() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = SteamCMDPaths(managedRuntimeRoot: root)
+        let runner = FakeProcessRunner()
+
+        try FileManager.default.createDirectory(at: paths.steamCMDDirectory, withIntermediateDirectories: true)
+        try writeExecutable("#!/usr/bin/env bash\n", to: paths.executableURL)
+        try writeExecutable("binary", to: paths.steamCMDExecutableURL)
+        runner.onRun = { executableURL, arguments, output, _ in
+            guard executableURL == paths.steamCMDExecutableURL,
+                  arguments.contains("+workshop_download_item") else { return }
+            output("Login Failure: Invalid Password")
+        }
+
+        let core = SteamCMDRunnerCore(paths: paths, processRunner: runner)
+
+        do {
+            _ = try await core.downloadItem(itemID: "3314492008", login: .account(username: "alice", password: "bad", steamGuardCode: nil), output: { _ in })
+            XCTFail("Expected login failure output to fail the download")
+        } catch let error as SteamCMDError {
+            switch error {
+            case .loginFailed(let recentOutput):
+                XCTAssertEqual(recentOutput, ["Login Failure: Invalid Password"])
+            default:
+                XCTFail("Expected loginFailed, got \(error)")
+            }
+        }
+    }
+
+    func testSteamCMDRunnerCoreReturnsActualDownloadedDirectoryFromOutput() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = SteamCMDPaths(managedRuntimeRoot: root)
+        let runner = FakeProcessRunner()
+        let actualDirectory = root
+            .appendingPathComponent("ActualSteamLibrary", isDirectory: true)
+            .appendingPathComponent("steamapps/workshop/content/431960/3314492008", isDirectory: true)
+
+        try FileManager.default.createDirectory(at: paths.steamCMDDirectory, withIntermediateDirectories: true)
+        try writeExecutable("#!/usr/bin/env bash\n", to: paths.executableURL)
+        try writeExecutable("binary", to: paths.steamCMDExecutableURL)
+        runner.onRun = { executableURL, arguments, output, _ in
+            guard executableURL == paths.steamCMDExecutableURL,
+                  arguments.contains("+workshop_download_item") else { return }
+            output("Success. Downloaded item 3314492008 to \"\(actualDirectory.path)\" (337262343 bytes)")
+        }
+
+        let core = SteamCMDRunnerCore(paths: paths, processRunner: runner)
+        let result = try await core.downloadItem(itemID: "3314492008", login: .account(username: "alice", password: "secret", steamGuardCode: nil), output: { _ in })
+
+        XCTAssertEqual(result.downloadedItemURL, actualDirectory)
     }
 
     func testSteamCMDInstallUsesManagedRuntimeWithoutUserSelectedDirectory() async throws {
@@ -1724,7 +1914,6 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = SteamCMDPaths(applicationSupportDirectory: root)
         let runner = FakeProcessRunner(terminationStatus: 126)
-        runner.terminationStatuses = [0, 126]
 
         try FileManager.default.createDirectory(at: paths.steamCMDDirectory, withIntermediateDirectories: true)
         try writeExecutable("#!/usr/bin/env bash\n", to: paths.executableURL)
@@ -1810,12 +1999,18 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
     private final class RecordingSteamCMDClient: SteamCMDClient {
         let paths: SteamCMDPaths
         private(set) var clearLoginSessionCallCount = 0
+        private(set) var installIfMissingCallCount = 0
+        private(set) var downloadCalls = [(itemID: String, login: SteamCMDLogin)]()
+        var downloadError: Error?
+        var outputEvents = [SteamCMDOutputEvent]()
+        var createDownloadedDirectory = true
 
         init(paths: SteamCMDPaths) {
             self.paths = paths
         }
 
         func installIfMissing(progress: @escaping (SteamCMDInstallState) -> Void) async throws -> SteamCMDRunnerResult {
+            installIfMissingCallCount += 1
             progress(.installed(paths.executableURL))
             return SteamCMDRunnerResult(runtimeURL: paths.steamCMDDirectory, downloadedItemURL: nil, recentOutput: [])
         }
@@ -1830,9 +2025,20 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
             login: SteamCMDLogin,
             output: @escaping (SteamCMDOutputEvent) -> Void
         ) async throws -> SteamCMDRunnerResult {
-            SteamCMDRunnerResult(
+            downloadCalls.append((itemID: itemID, login: login))
+            for event in outputEvents {
+                output(event)
+            }
+            if let downloadError {
+                throw downloadError
+            }
+            let directory = paths.workshopContentDirectory.appendingPathComponent(itemID, isDirectory: true)
+            if createDownloadedDirectory {
+                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            }
+            return SteamCMDRunnerResult(
                 runtimeURL: paths.steamCMDDirectory,
-                downloadedItemURL: paths.workshopContentDirectory.appendingPathComponent(itemID, isDirectory: true),
+                downloadedItemURL: directory,
                 recentOutput: []
             )
         }
@@ -1853,6 +2059,31 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
                 legacyWorkshopDirectories: []
             )
         }
+    }
+
+    private func withStoredWorkshopUsername(_ username: String?, run body: () async throws -> Void) async rethrows {
+        let key = "SteamWorkshopUsername"
+        let previous = UserDefaults.standard.string(forKey: key)
+        if let username {
+            UserDefaults.standard.set(username, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        defer {
+            if let previous {
+                UserDefaults.standard.set(previous, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        try await body()
+    }
+
+    private func writeSteamCMDAccountState(paths: SteamCMDPaths, username: String = "alice") throws {
+        let configDirectory = paths.steamHomeDirectory.appendingPathComponent("config", isDirectory: true)
+        try FileManager.default.createDirectory(at: configDirectory, withIntermediateDirectories: true)
+        let configFile = configDirectory.appendingPathComponent("config.vdf")
+        try Data(#""Accounts" { "\#(username)" { "SteamID" "76561198000000000" } }"#.utf8).write(to: configFile)
     }
 
     private func writeExecutable(_ contents: String, to url: URL) throws {
@@ -1906,11 +2137,10 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
     func testWorkshopDownloadInputBuildsPasswordLoginWithoutPersistingPassword() throws {
         let request = try SteamWorkshopDownloadInput(
             itemInput: "https://steamcommunity.com/sharedfiles/filedetails/?id=3004222851",
-            loginMode: .password,
             username: " alice ",
             password: " secret ",
             steamGuardCode: " 12345 "
-        ).makeRequest()
+        ).makePasswordRequest()
 
         XCTAssertEqual(request.itemID, "3004222851")
         XCTAssertEqual(
@@ -1919,30 +2149,164 @@ final class Open_Wallpaper_EngineTests: XCTestCase {
         )
     }
 
-    func testWorkshopDownloadInputBuildsSavedSessionLoginWithoutPassword() throws {
-        let request = try SteamWorkshopDownloadInput(
+    func testWorkshopDownloadInputRequiresPassword() throws {
+        let input = SteamWorkshopDownloadInput(
             itemInput: "3004222851",
-            loginMode: .savedSession,
-            username: " alice ",
+            username: "alice",
             password: "",
             steamGuardCode: ""
-        ).makeRequest()
+        )
 
-        XCTAssertEqual(request.itemID, "3004222851")
-        XCTAssertEqual(request.login, .savedSession(username: "alice"))
+        XCTAssertThrowsError(try input.makePasswordRequest()) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Enter your Steam password to sign in to SteamCMD."
+            )
+        }
     }
 
-    func testWorkshopDownloadInputBuildsAnonymousLoginExplicitly() throws {
-        let request = try SteamWorkshopDownloadInput(
-            itemInput: "3004222851",
-            loginMode: .anonymous,
-            username: "",
-            password: "",
-            steamGuardCode: ""
-        ).makeRequest()
+    @MainActor
+    func testWorkshopBrowserReusesSteamCMDSessionWhenPasswordIsEmpty() async throws {
+        try await withStoredWorkshopUsername("alice") {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = SteamCMDPaths(applicationSupportDirectory: root)
+            try writeSteamCMDAccountState(paths: paths)
+            let resolution = SteamCMDPathResolution(paths: paths, source: .managedRuntime, legacyPaths: [])
+            let client = RecordingSteamCMDClient(paths: paths)
+            let service = SteamCMDService(resolution: resolution, client: client)
+            let viewModel = SteamWorkshopBrowserViewModel(
+                steamCMDResolution: resolution,
+                steamCMDService: service
+            )
+            viewModel.manualItemInput = "3004222851"
+            viewModel.password = ""
 
-        XCTAssertEqual(request.itemID, "3004222851")
-        XCTAssertEqual(request.login, .anonymous)
+            _ = await viewModel.download()
+
+            XCTAssertEqual(client.downloadCalls.count, 1)
+            XCTAssertEqual(client.downloadCalls.first?.login, .savedSession(username: "alice"))
+        }
+    }
+
+    @MainActor
+    func testWorkshopBrowserRequiresPasswordWithoutReusableSteamCMDSession() async throws {
+        await withStoredWorkshopUsername(nil) {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = SteamCMDPaths(applicationSupportDirectory: root)
+            let resolution = SteamCMDPathResolution(paths: paths, source: .managedRuntime, legacyPaths: [])
+            let client = RecordingSteamCMDClient(paths: paths)
+            let service = SteamCMDService(resolution: resolution, client: client)
+            let viewModel = SteamWorkshopBrowserViewModel(
+                steamCMDResolution: resolution,
+                steamCMDService: service
+            )
+            viewModel.manualItemInput = "3004222851"
+            viewModel.username = "alice"
+            viewModel.password = ""
+
+            let wallpaper = await viewModel.download()
+
+            XCTAssertNil(wallpaper)
+            XCTAssertEqual(client.installIfMissingCallCount, 0)
+            XCTAssertEqual(client.downloadCalls.count, 0)
+            XCTAssertEqual(viewModel.statusMessage, "Enter your Steam password to sign in to SteamCMD.")
+        }
+    }
+
+    @MainActor
+    func testWorkshopBrowserRequiresUsernameBeforePasswordWithoutReusableSteamCMDSession() async throws {
+        await withStoredWorkshopUsername(nil) {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = SteamCMDPaths(applicationSupportDirectory: root)
+            let resolution = SteamCMDPathResolution(paths: paths, source: .managedRuntime, legacyPaths: [])
+            let client = RecordingSteamCMDClient(paths: paths)
+            let service = SteamCMDService(resolution: resolution, client: client)
+            let viewModel = SteamWorkshopBrowserViewModel(
+                steamCMDResolution: resolution,
+                steamCMDService: service
+            )
+            viewModel.manualItemInput = "3004222851"
+            viewModel.username = ""
+            viewModel.password = ""
+
+            let wallpaper = await viewModel.download()
+
+            XCTAssertNil(wallpaper)
+            XCTAssertEqual(client.installIfMissingCallCount, 0)
+            XCTAssertEqual(client.downloadCalls.count, 0)
+            XCTAssertEqual(viewModel.statusMessage, "Enter your Steam username to sign in to SteamCMD.")
+        }
+    }
+
+    @MainActor
+    func testWorkshopBrowserInvalidatesExpiredReusableSteamCMDSession() async throws {
+        try await withStoredWorkshopUsername("alice") {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = SteamCMDPaths(applicationSupportDirectory: root)
+            try writeSteamCMDAccountState(paths: paths)
+            let resolution = SteamCMDPathResolution(paths: paths, source: .managedRuntime, legacyPaths: [])
+            let client = RecordingSteamCMDClient(paths: paths)
+            client.downloadError = SteamCMDError.steamGuardRequired(recentOutput: ["Steam Guard code:"])
+            let service = SteamCMDService(resolution: resolution, client: client)
+            let viewModel = SteamWorkshopBrowserViewModel(
+                steamCMDResolution: resolution,
+                steamCMDService: service
+            )
+            viewModel.manualItemInput = "3004222851"
+            viewModel.password = ""
+
+            _ = await viewModel.download()
+
+            XCTAssertEqual(client.downloadCalls.count, 1)
+            XCTAssertEqual(viewModel.statusMessage, "Saved SteamCMD login expired. Enter your Steam password and current Steam Guard code, then download again.")
+
+            client.downloadError = nil
+            _ = await viewModel.download()
+
+            XCTAssertEqual(client.downloadCalls.count, 1)
+            XCTAssertEqual(viewModel.statusMessage, "Enter your Steam password to sign in to SteamCMD.")
+        }
+    }
+
+    @MainActor
+    func testWorkshopBrowserPasswordLoginSuccessSavesUsernameForFutureReuse() async throws {
+        await withStoredWorkshopUsername(nil) {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = SteamCMDPaths(applicationSupportDirectory: root)
+            let resolution = SteamCMDPathResolution(paths: paths, source: .managedRuntime, legacyPaths: [])
+            let client = RecordingSteamCMDClient(paths: paths)
+            client.outputEvents = [.loginSucceeded]
+            let service = SteamCMDService(resolution: resolution, client: client)
+            let viewModel = SteamWorkshopBrowserViewModel(
+                steamCMDResolution: resolution,
+                steamCMDService: service
+            )
+            viewModel.manualItemInput = "3004222851"
+            viewModel.username = " alice "
+            viewModel.password = " secret "
+            viewModel.steamGuardCode = " 12345 "
+
+            _ = await viewModel.download()
+
+            XCTAssertEqual(
+                client.downloadCalls.first?.login,
+                .account(username: "alice", password: "secret", steamGuardCode: "12345")
+            )
+            XCTAssertEqual(UserDefaults.standard.string(forKey: "SteamWorkshopUsername"), "alice")
+            XCTAssertEqual(viewModel.username, "alice")
+            XCTAssertEqual(viewModel.password, "")
+            XCTAssertEqual(viewModel.steamGuardCode, "")
+        }
     }
 
     func testCachedKeychainCredentialStoreCachesLoadedString() throws {
